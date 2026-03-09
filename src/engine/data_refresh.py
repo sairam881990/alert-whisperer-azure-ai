@@ -44,6 +44,7 @@ Why this design:
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Optional
@@ -86,6 +87,54 @@ class ConnectorStatus:
         self.last_error: Optional[str] = None
         self.alerts_fetched: int = 0
         self.total_polls: int = 0
+
+        # D9: per-connector query latency tracking
+        # All latency values are stored in milliseconds.
+        self._latency_samples: list[float] = []  # rolling window of poll durations
+        self._latency_window: int = 100          # keep last N samples
+        self.last_latency_ms: Optional[float] = None
+        self.average_latency_ms: Optional[float] = None
+        self.p95_latency_ms: Optional[float] = None
+        self.min_latency_ms: Optional[float] = None
+        self.max_latency_ms: Optional[float] = None
+
+    def record_poll_latency(self, duration_ms: float) -> None:
+        """
+        Record the wall-clock duration of a single poll cycle.
+
+        Maintains a rolling window of ``_latency_window`` samples and
+        recomputes aggregate statistics (average, p95, min, max) after
+        every observation.
+
+        Args:
+            duration_ms: Elapsed time in milliseconds for the poll.
+        """
+        self._latency_samples.append(duration_ms)
+        # Trim to rolling window
+        if len(self._latency_samples) > self._latency_window:
+            self._latency_samples = self._latency_samples[-self._latency_window:]
+
+        self.last_latency_ms = duration_ms
+        n = len(self._latency_samples)
+        self.average_latency_ms = sum(self._latency_samples) / n
+        self.min_latency_ms = min(self._latency_samples)
+        self.max_latency_ms = max(self._latency_samples)
+
+        # p95 via nearest-rank method
+        sorted_samples = sorted(self._latency_samples)
+        p95_idx = max(0, int(0.95 * n) - 1)
+        self.p95_latency_ms = sorted_samples[p95_idx]
+
+    @property
+    def latency_summary(self) -> str:
+        """Human-readable latency string for UI display."""
+        if self.average_latency_ms is None:
+            return "no data"
+        return (
+            f"avg={self.average_latency_ms:.0f}ms "
+            f"p95={self.p95_latency_ms:.0f}ms "
+            f"last={self.last_latency_ms:.0f}ms"
+        )
 
     @property
     def status_icon(self) -> str:
@@ -215,12 +264,26 @@ class DataRefreshEngine:
             if not status.connected or not status.connector:
                 continue
             try:
+                # D9: measure wall-clock time for this poll cycle
+                _poll_start = time.monotonic()
                 alerts = self._poll_connector(name, status)
+                _poll_elapsed_ms = (time.monotonic() - _poll_start) * 1000.0
+
                 new_alerts.extend(alerts)
                 status.last_poll_ts = datetime.now(timezone.utc)
                 status.alerts_fetched += len(alerts)
                 status.total_polls += 1
                 status.last_error = None
+
+                # D9: record latency sample
+                status.record_poll_latency(_poll_elapsed_ms)
+                logger.debug(
+                    "connector_poll_latency",
+                    name=name,
+                    latency_ms=round(_poll_elapsed_ms, 1),
+                    avg_ms=round(status.average_latency_ms or 0, 1),
+                    p95_ms=round(status.p95_latency_ms or 0, 1),
+                )
             except Exception as e:
                 status.last_error = str(e)
                 logger.error("connector_poll_failed", name=name, error=str(e))
@@ -403,6 +466,13 @@ class DataRefreshEngine:
                     "status": cs.status_label,
                     "alerts_fetched": cs.alerts_fetched,
                     "total_polls": cs.total_polls,
+                    # D9: latency stats
+                    "last_latency_ms": round(cs.last_latency_ms, 1) if cs.last_latency_ms is not None else None,
+                    "average_latency_ms": round(cs.average_latency_ms, 1) if cs.average_latency_ms is not None else None,
+                    "p95_latency_ms": round(cs.p95_latency_ms, 1) if cs.p95_latency_ms is not None else None,
+                    "min_latency_ms": round(cs.min_latency_ms, 1) if cs.min_latency_ms is not None else None,
+                    "max_latency_ms": round(cs.max_latency_ms, 1) if cs.max_latency_ms is not None else None,
+                    "latency_summary": cs.latency_summary,
                 }
                 for name, cs in self.connectors.items()
             },

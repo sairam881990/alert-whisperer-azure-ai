@@ -170,6 +170,149 @@ class TopicTreeRetriever:
             ],
         )
 
+    def update_topic_tree_from_documents(
+        self,
+        documents: list[DocumentChunk],
+        min_docs_for_topic: int = 3,
+    ) -> dict[str, Any]:
+        """
+        R15: Dynamically update the topic tree based on indexed documents.
+
+        Scans the provided document chunks for common error patterns and
+        pipeline names, then adds new leaf nodes (or updates existing ones)
+        in the topic tree to reflect what's actually indexed.
+
+        This allows the topic tree to grow as new runbooks and incidents
+        are indexed, rather than relying purely on the hardcoded taxonomy.
+
+        Args:
+            documents: List of indexed DocumentChunk objects to analyse
+            min_docs_for_topic: Minimum number of documents mentioning a
+                pattern before a new topic node is created.
+
+        Returns:
+            Summary dict with counts of nodes added and updated.
+        """
+        from collections import Counter as _Counter
+
+        # --- Extract pipeline names and error patterns from documents ---
+        pipeline_counter: _Counter = _Counter()
+        error_counter: _Counter = _Counter()
+
+        # Common error pattern markers to detect from document content
+        error_extractors = [
+            (r"(OutOfMemory(?:Error)?|Java heap space|GC overhead)", "Spark Errors"),
+            (r"(Shuffle(?:Fetch)?Fail(?:ure|ed)|FetchFailedException)", "Spark Errors"),
+            (r"(MappingNotFound|ingestion mapping|Permanent_MappingNotFound)", "Kusto Errors"),
+            (r"(TimeoutException|Activity timed out|pipeline timeout)", "Synapse Errors"),
+            (r"(AuthenticationFailure|token expired|AADSTS|credential invalid)", "Infrastructure Errors"),
+            (r"(ConnectionError|DNS resolution|private endpoint|firewall)", "Infrastructure Errors"),
+            (r"(CopyActivity.*fail|data movement|source.*sink)", "Synapse Errors"),
+        ]
+
+        for chunk in documents:
+            content = chunk.content
+
+            # Extract pipeline names from metadata
+            pipeline = chunk.metadata.get("pipeline_name", "")
+            if pipeline:
+                pipeline_counter[pipeline] += 1
+
+            # Extract error class from metadata
+            error_class = chunk.metadata.get("error_class", "")
+            if error_class:
+                error_counter[error_class] += 1
+
+            # Extract patterns from content
+            for pattern, parent_topic in error_extractors:
+                matches = re.findall(pattern, content, re.IGNORECASE)
+                for match in matches:
+                    canonical = match.strip()[:60]
+                    error_counter[canonical] += 1
+
+        # --- Add/update topic nodes ---
+        nodes_added = 0
+        nodes_updated = 0
+
+        # Helper: find a node by topic name (BFS)
+        def _find_node(root: TopicNode, topic_name: str) -> Optional[TopicNode]:
+            queue = [root]
+            while queue:
+                node = queue.pop(0)
+                if node.topic == topic_name:
+                    return node
+                queue.extend(node.children)
+            return None
+
+        # Add pipeline-specific nodes under the relevant parent
+        for pipeline_name, count in pipeline_counter.items():
+            if count < min_docs_for_topic:
+                continue
+            # Don't duplicate existing nodes
+            if _find_node(self.root, pipeline_name):
+                node = _find_node(self.root, pipeline_name)
+                if node:
+                    nodes_updated += 1
+                continue
+            # Find the best parent based on error patterns associated with this pipeline
+            parent_node = _find_node(self.root, "Spark Errors") or self.root
+            new_node = TopicNode(
+                topic=pipeline_name,
+                description=f"Auto-discovered topic from {count} indexed documents",
+                relevant_doc_ids=[
+                    c.chunk_id for c in documents
+                    if c.metadata.get("pipeline_name") == pipeline_name
+                ],
+            )
+            parent_node.children.append(new_node)
+            nodes_added += 1
+
+        # Add error-class-specific leaf nodes
+        for error_class, count in error_counter.items():
+            if count < min_docs_for_topic:
+                continue
+            if _find_node(self.root, error_class):
+                nodes_updated += 1
+                continue
+            # Route to the appropriate parent
+            ec_lower = error_class.lower()
+            if any(kw in ec_lower for kw in ["oom", "memory", "heap", "gc"]):
+                parent_name = "OutOfMemory"
+            elif any(kw in ec_lower for kw in ["shuffle", "fetch"]):
+                parent_name = "Shuffle Failures"
+            elif any(kw in ec_lower for kw in ["timeout"]):
+                parent_name = "Spark Timeout"
+            elif any(kw in ec_lower for kw in ["auth", "token", "credential"]):
+                parent_name = "Authentication & Secrets"
+            elif any(kw in ec_lower for kw in ["network", "dns", "endpoint", "connection"]):
+                parent_name = "Network Connectivity"
+            elif any(kw in ec_lower for kw in ["mapping", "ingestion", "kusto"]):
+                parent_name = "Ingestion Failures"
+            else:
+                parent_name = "Infrastructure Errors"
+
+            parent_node = _find_node(self.root, parent_name) or self.root
+            new_node = TopicNode(
+                topic=error_class,
+                description=f"Auto-discovered error pattern ({count} occurrences)",
+                relevant_doc_ids=[
+                    c.chunk_id for c in documents
+                    if c.metadata.get("error_class") == error_class
+                    or error_class.lower() in c.content.lower()
+                ],
+            )
+            parent_node.children.append(new_node)
+            nodes_added += 1
+
+        summary = {
+            "nodes_added": nodes_added,
+            "nodes_updated": nodes_updated,
+            "pipelines_discovered": len([p for p, c in pipeline_counter.items() if c >= min_docs_for_topic]),
+            "errors_discovered": len([e for e, c in error_counter.items() if c >= min_docs_for_topic]),
+        }
+        logger.info("topic_tree_updated_from_documents", **summary)
+        return summary
+
     def classify_error(self, error_message: str, source: str = "") -> list[TopicNode]:
         """
         Classify an error message into topic tree branches.
@@ -341,6 +484,143 @@ class CRAGEvaluator:
         return result, action
 
 
+class CRAGSecondaryRetriever:
+    """
+    R8: Secondary retrieval fallback for CRAG when all retrieved documents
+    are low quality (all graded INCORRECT).
+
+    When no correct or ambiguous results are found, this class attempts a
+    broader secondary retrieval strategy:
+    1. Broadened query (drops specific error terms)
+    2. Different index / source type (e.g., switch from ICM to Confluence)
+    3. Generic troubleshooting context as last resort
+    """
+
+    def __init__(
+        self,
+        vector_store: Optional["VectorStore"] = None,
+        crag_evaluator: Optional["CRAGEvaluator"] = None,
+    ):
+        self.vector_store = vector_store
+        self.crag_evaluator = crag_evaluator or CRAGEvaluator()
+
+    async def retrieve_fallback(
+        self,
+        query: str,
+        failed_chunks: list[DocumentChunk],
+        original_source_type: Optional[str] = None,
+        top_k: int = 5,
+    ) -> tuple[list[DocumentChunk], str]:
+        """
+        Attempt secondary retrieval when primary CRAG pass produces no relevant chunks.
+
+        Strategy:
+        1. Broaden the query by removing specific error codes/numbers
+        2. Try a different source (if original was ICM, try Confluence, and vice versa)
+        3. Return whatever is found with a fallback action label
+
+        Args:
+            query: Original retrieval query
+            failed_chunks: Chunks that were all graded INCORRECT
+            original_source_type: The source that was originally queried
+            top_k: Max results for secondary search
+
+        Returns:
+            Tuple of (chunks, action_description)
+        """
+        if not self.vector_store:
+            logger.warning("crag_secondary_no_vector_store", msg="Cannot perform secondary retrieval without vector_store")
+            return [], "secondary_skipped_no_store"
+
+        # Step 1: Broaden the query
+        broadened_query = self._broaden_query(query)
+        logger.info(
+            "crag_secondary_retrieval_started",
+            original_query=query[:80],
+            broadened_query=broadened_query[:80],
+            original_source=original_source_type,
+        )
+
+        # Step 2: Pick an alternative source type
+        alt_source = self._pick_alternative_source(original_source_type)
+
+        # Attempt 1: Broader query on same or alternative source
+        try:
+            result = await self.vector_store.search(
+                query=broadened_query,
+                top_k=top_k,
+                source_type=alt_source,
+                use_hybrid=True,
+            )
+            if result.chunks:
+                # Regrade the secondary results
+                grades = self.crag_evaluator.grade_retrieval(query, result.chunks)
+                corrected, action = self.crag_evaluator.apply_correction(result.chunks, grades)
+                if corrected:
+                    logger.info(
+                        "crag_secondary_success",
+                        strategy="broadened_query",
+                        source=alt_source,
+                        chunks_found=len(corrected),
+                    )
+                    return corrected, f"secondary_broadened_query_{alt_source or 'all'}"
+        except Exception as e:
+            logger.warning("crag_secondary_attempt1_failed", error=str(e))
+
+        # Attempt 2: Original query on all sources (no source filter)
+        if original_source_type is not None:
+            try:
+                result = await self.vector_store.search(
+                    query=query,
+                    top_k=top_k,
+                    source_type=None,  # Lift source filter
+                    use_hybrid=True,
+                )
+                if result.chunks:
+                    grades = self.crag_evaluator.grade_retrieval(query, result.chunks)
+                    corrected, action = self.crag_evaluator.apply_correction(result.chunks, grades)
+                    if corrected:
+                        logger.info(
+                            "crag_secondary_success",
+                            strategy="lifted_source_filter",
+                            chunks_found=len(corrected),
+                        )
+                        return corrected, "secondary_all_sources"
+            except Exception as e:
+                logger.warning("crag_secondary_attempt2_failed", error=str(e))
+
+        logger.warning("crag_secondary_no_results", query=query[:80])
+        return [], "secondary_exhausted_no_results"
+
+    @staticmethod
+    def _broaden_query(query: str) -> str:
+        """
+        Broaden a specific query by stripping numeric identifiers,
+        error codes, and very specific tokens to improve recall.
+        """
+        # Remove hex codes, error numbers, and quoted strings
+        broadened = re.sub(r'0x[0-9a-fA-F]+', '', query)
+        broadened = re.sub(r'\b[0-9a-f]{8,}\b', '', broadened)  # Long hex IDs
+        broadened = re.sub(r'\d{4,}', '', broadened)  # Long numeric codes
+        broadened = re.sub(r'"[^"]+"', '', broadened)  # Quoted strings
+        broadened = re.sub(r"'[^']+'", '', broadened)  # Single-quoted strings
+        broadened = re.sub(r'\s+', ' ', broadened).strip()
+        # Fallback: if broadening removed too much, return first 60 chars of original
+        return broadened if len(broadened) > 20 else query[:200].split('.')[0]
+
+    @staticmethod
+    def _pick_alternative_source(original_source_type: Optional[str]) -> Optional[str]:
+        """
+        Pick an alternative source to try for secondary retrieval.
+        ICM <-> Confluence swap; log_analytics falls back to all sources.
+        """
+        if original_source_type == "icm":
+            return "confluence"
+        if original_source_type == "confluence":
+            return "icm"
+        return None  # No filter — search all sources
+
+
 class LLMJudgeCRAG:
     """
     LLM-as-judge for CRAG relevance grading.
@@ -496,6 +776,53 @@ class HyDEGenerator:
             "2) Review recent changes, 3) Compare with similar past incidents, "
             "4) Apply mitigation steps from runbook."
         ),
+        # R6: Additional HyDE templates for broader coverage
+        "auth_permission": (
+            "Resolution for Authentication / Permission Error:\n"
+            "Pipeline {pipeline} failed with {error_hint} due to an AAD token, "
+            "RBAC role assignment, or Key Vault access issue. "
+            "Resolution: Verify Managed Identity or Service Principal has required "
+            "role assignments (Storage Blob Data Contributor, Key Vault Secrets User). "
+            "Check AAD token expiry and refresh policy. Validate Key Vault network "
+            "access rules for the pipeline's VNet/subnet. Re-grant RBAC if recently rotated."
+        ),
+        "network_connectivity": (
+            "Resolution for Network Connectivity Error:\n"
+            "Pipeline {pipeline} encountered {error_hint} caused by DNS resolution "
+            "failure, firewall rule blocking outbound traffic, or private endpoint "
+            "misconfiguration. "
+            "Resolution: Verify DNS resolution for the target service endpoint. "
+            "Check NSG/firewall rules allow traffic on required ports. "
+            "Validate private endpoint DNS zone is linked to the pipeline VNet. "
+            "Test connectivity from within the pipeline runtime environment."
+        ),
+        "resource_throttling": (
+            "Resolution for Resource Throttling / Rate Limit Error:\n"
+            "Pipeline {pipeline} hit {error_hint} — DTU limit, RU/s throttle, "
+            "or HTTP 429 Too Many Requests from a downstream service. "
+            "Resolution: Increase DTU/RU provisioning or enable autoscale. "
+            "Implement exponential backoff and retry logic. "
+            "Spread load across time windows or partition keys. "
+            "Monitor quota consumption via Azure Monitor and set budget alerts."
+        ),
+        "schema_drift": (
+            "Resolution for Schema Drift / Column Mismatch Error:\n"
+            "Pipeline {pipeline} failed with {error_hint} due to a column name "
+            "mismatch, data type change, or schema evolution in the upstream source. "
+            "Resolution: Enable schema evolution handling in the ingestion layer. "
+            "Update the mapping definition to reflect new column names or types. "
+            "Add schema validation as a pre-flight check before ingestion. "
+            "Coordinate schema changes with upstream team and update runbook."
+        ),
+        "data_quality": (
+            "Resolution for Data Quality Error:\n"
+            "Pipeline {pipeline} encountered {error_hint} — null values in required "
+            "fields, duplicate key violations, or data validation rule failures. "
+            "Resolution: Add null-check assertions before downstream processing. "
+            "Deduplicate source data using a deterministic key. "
+            "Implement data quality gates with configurable thresholds. "
+            "Review source system for data completeness and consistency."
+        ),
     }
 
     def generate_hypothetical_document(
@@ -560,6 +887,17 @@ class HyDEGenerator:
             return "synapse_timeout"
         if any(kw in combined for kw in ["kusto", "ingestion", "mapping"]):
             return "kusto_ingestion"
+        # R6: Route to new template categories
+        if any(kw in combined for kw in ["auth", "aad", "token", "rbac", "keyvault", "managed identity", "permission", "403", "401"]):
+            return "auth_permission"
+        if any(kw in combined for kw in ["dns", "firewall", "private endpoint", "network", "connectivity", "connection refused", "unreachable"]):
+            return "network_connectivity"
+        if any(kw in combined for kw in ["throttl", "429", "dtu", "ru/s", "rate limit", "quota", "too many requests"]):
+            return "resource_throttling"
+        if any(kw in combined for kw in ["schema", "column", "mismatch", "schema drift", "schema evolution", "type mismatch"]):
+            return "schema_drift"
+        if any(kw in combined for kw in ["null", "duplicate", "validation", "data quality", "missing value", "constraint"]):
+            return "data_quality"
         return "generic"
 
     @staticmethod
@@ -631,40 +969,95 @@ class FLARERetriever:
         self.confidence_threshold = confidence_threshold
         self.max_retrieval_rounds = max_retrieval_rounds
 
+    # R14: Scored uncertainty detection with signal weights and position weighting
+    # Each pattern tuple: (regex, signal_type, base_weight)
+    UNCERTAINTY_PATTERNS: list[tuple[str, str, float]] = [
+        # High-weight: explicit uncertainty statements at sentence start carry more weight
+        (r"(?:i'?m?\s+not\s+sure|i\s+don'?t\s+know|uncertain|unclear)", "explicit_uncertainty", 0.9),
+        (r"(?:not\s+enough\s+context|insufficient\s+(?:data|information|context))", "context_gap", 0.85),
+        (r"(?:more\s+information\s+(?:is\s+)?needed|need(?:s)?\s+to\s+investigate)", "info_gap", 0.80),
+        # Medium-weight: hedging/probabilistic language
+        (r"(?:might|may|could)\s+(?:be|indicate|suggest|mean)", "hedging_modal", 0.65),
+        (r"(?:possibly|perhaps|probably|potentially|likely)", "probabilistic_language", 0.60),
+        (r"(?:seems?\s+to|appears?\s+to|looks?\s+like)", "soft_assertion", 0.55),
+        # Lower-weight: placeholder and generic advice markers
+        (r"\[(?:unknown|tbd|todo|check|n/?a)\]", "placeholder_markers", 0.75),
+        (r"(?:check\s+the\s+logs?|review\s+the\s+documentation|contact\s+support)", "generic_advice", 0.50),
+        (r"(?:further\s+(?:analysis|investigation|review)\s+(?:is\s+)?(?:needed|required))", "defer_analysis", 0.70),
+    ]
+    # Minimum scored confidence to include a segment in retrieval candidates
+    UNCERTAINTY_SCORE_THRESHOLD: float = 0.5
+
     def detect_low_confidence_segments(
         self,
         generated_text: str,
     ) -> list[str]:
         """
-        Scan generated text for segments that indicate low confidence
-        and would benefit from additional retrieval.
+        R14: Scan generated text for segments that indicate low confidence.
 
-        Detects:
-        - Hedging language ("might be", "possibly", "I'm not sure")
-        - Incomplete information markers ("[unknown]", "...")
-        - Generic placeholder advice ("check the logs", "contact support")
-        - References to unknown components or unclear dependencies
+        Uses scored uncertainty detection instead of simple regex matching:
+        - Each pattern has a base weight
+        - Position within the sentence boosts the score (sentence-initial patterns
+          carry more uncertainty signal than sentence-medial occurrences)
+        - Segments with aggregated score ≥ UNCERTAINTY_SCORE_THRESHOLD are returned,
+          ordered by score descending (highest uncertainty first)
         """
-        low_confidence_patterns = [
-            (r"(?:might|may|could)\s+be", "hedging_language"),
-            (r"(?:i'm\s+not\s+sure|uncertain|unclear)", "explicit_uncertainty"),
-            (r"(?:possibly|perhaps|probably)", "probabilistic_language"),
-            (r"\[(?:unknown|tbd|todo|check)\]", "placeholder_markers"),
-            (r"(?:check\s+the\s+logs?|review\s+the\s+documentation)", "generic_advice"),
-            (r"(?:more\s+information\s+(?:is\s+)?needed|need\s+to\s+investigate)", "info_gap"),
-            (r"(?:not\s+enough\s+context|insufficient\s+data)", "context_gap"),
+        # Split into sentences for position-aware scoring
+        sentences = re.split(r'(?<=[.!?])\s+', generated_text)
+        sentence_boundaries: list[tuple[int, int]] = []
+        pos = 0
+        for sent in sentences:
+            sentence_boundaries.append((pos, pos + len(sent)))
+            pos += len(sent) + 1  # +1 for the space/newline
+
+        segment_scores: dict[str, float] = {}
+        segment_positions: dict[str, int] = {}  # track first occurrence position
+
+        for pattern, signal_type, base_weight in self.UNCERTAINTY_PATTERNS:
+            for match in re.finditer(pattern, generated_text, re.IGNORECASE):
+                match_start = match.start()
+
+                # Position-within-sentence boost: matches near sentence start score higher
+                # Find which sentence this match falls in
+                position_factor = 1.0
+                for s_idx, (s_start, s_end) in enumerate(sentence_boundaries):
+                    if s_start <= match_start < s_end:
+                        sentence_len = max(s_end - s_start, 1)
+                        rel_pos = (match_start - s_start) / sentence_len
+                        # Sentence-initial: boost; sentence-final: neutral
+                        position_factor = 1.0 + 0.3 * (1.0 - rel_pos)
+                        break
+
+                scored_weight = base_weight * position_factor
+
+                # Extract surrounding context (80 chars before/after for better queries)
+                ctx_start = max(0, match_start - 80)
+                ctx_end = min(len(generated_text), match.end() + 80)
+                segment = generated_text[ctx_start:ctx_end].strip()
+
+                if segment in segment_scores:
+                    # Accumulate scores for overlapping/repeated patterns
+                    segment_scores[segment] = min(1.0, segment_scores[segment] + scored_weight * 0.2)
+                else:
+                    segment_scores[segment] = scored_weight
+                    segment_positions[segment] = match_start
+
+        # Filter by threshold and sort by score descending
+        qualifying = [
+            (seg, score)
+            for seg, score in segment_scores.items()
+            if score >= self.UNCERTAINTY_SCORE_THRESHOLD
         ]
+        qualifying.sort(key=lambda x: x[1], reverse=True)
 
-        segments_needing_retrieval = []
-        for pattern, reason in low_confidence_patterns:
-            matches = re.finditer(pattern, generated_text, re.IGNORECASE)
-            for match in matches:
-                # Extract surrounding context (50 chars before/after)
-                start = max(0, match.start() - 50)
-                end = min(len(generated_text), match.end() + 50)
-                segment = generated_text[start:end].strip()
-                segments_needing_retrieval.append(segment)
+        segments_needing_retrieval = [seg for seg, _ in qualifying]
 
+        logger.info(
+            "flare_uncertainty_detection",
+            total_segments_scanned=len(sentence_boundaries),
+            uncertain_segments=len(segments_needing_retrieval),
+            top_score=round(qualifying[0][1], 3) if qualifying else 0.0,
+        )
         return segments_needing_retrieval
 
     async def retrieve_for_segments(
@@ -998,7 +1391,86 @@ class GraphRAGEngine:
         #               nodes.append({"node_id": ds_id, "node_type": "component", "name": out.reference_name})
         #               edges.append({"source_id": f"adf_{pipeline.name}", "target_id": ds_id, "relationship": "WRITES_TO"})
 
-        logger.info("graphrag_adf_extraction_stub", msg="Implement with real ADF client")
+        # R9: Implement real ADF dependency extraction
+        try:
+            # Iterate over ADF pipelines using the standard Azure SDK interface
+            for pipeline in adf_client.pipelines.list():
+                pipeline_name = getattr(pipeline, "name", None) or pipeline.get("name", "")
+                if not pipeline_name:
+                    continue
+                pipeline_node_id = f"adf_{pipeline_name}"
+                nodes.append({
+                    "node_id": pipeline_node_id,
+                    "node_type": "pipeline",
+                    "name": pipeline_name,
+                })
+
+                # Extract activity-level dependencies
+                activities = (
+                    getattr(pipeline, "activities", None)
+                    or pipeline.get("properties", {}).get("activities", [])
+                    or []
+                )
+                for activity in activities:
+                    act_name = getattr(activity, "name", None) or activity.get("name", "")
+                    if not act_name:
+                        continue
+                    act_node_id = f"adf_{pipeline_name}_{act_name}"
+
+                    # Intra-pipeline activity dependencies (depends_on)
+                    depends_on = (
+                        getattr(activity, "depends_on", None)
+                        or activity.get("dependsOn", [])
+                        or []
+                    )
+                    for dep in depends_on:
+                        dep_name = getattr(dep, "activity", None) or dep.get("activity", "")
+                        if dep_name:
+                            edges.append({
+                                "source_id": f"adf_{pipeline_name}_{dep_name}",
+                                "target_id": act_node_id,
+                                "relationship": "FEEDS_INTO",
+                            })
+
+                    # Dataset/LinkedService references
+                    inputs = (
+                        getattr(activity, "inputs", None)
+                        or activity.get("inputs", [])
+                        or []
+                    )
+                    for inp in inputs:
+                        ref_name = getattr(inp, "reference_name", None) or inp.get("referenceName", "")
+                        if ref_name:
+                            ds_id = f"adf_dataset_{ref_name}"
+                            nodes.append({"node_id": ds_id, "node_type": "component", "name": ref_name})
+                            edges.append({"source_id": ds_id, "target_id": pipeline_node_id, "relationship": "READS_FROM"})
+
+                    outputs = (
+                        getattr(activity, "outputs", None)
+                        or activity.get("outputs", [])
+                        or []
+                    )
+                    for out in outputs:
+                        ref_name = getattr(out, "reference_name", None) or out.get("referenceName", "")
+                        if ref_name:
+                            ds_id = f"adf_dataset_{ref_name}"
+                            nodes.append({"node_id": ds_id, "node_type": "component", "name": ref_name})
+                            edges.append({"source_id": pipeline_node_id, "target_id": ds_id, "relationship": "WRITES_TO"})
+
+                    # Linked service references (connection-level dependencies)
+                    linked_service = (
+                        getattr(activity, "linked_service_name", None)
+                        or activity.get("linkedServiceName", {}).get("referenceName", "")
+                    )
+                    if linked_service:
+                        ls_id = f"adf_ls_{linked_service}"
+                        nodes.append({"node_id": ls_id, "node_type": "component", "name": linked_service})
+                        edges.append({"source_id": pipeline_node_id, "target_id": ls_id, "relationship": "USES_CONNECTION"})
+
+        except Exception as e:
+            logger.warning("graphrag_adf_extraction_partial", error=str(e))
+
+        logger.info("graphrag_adf_extracted", nodes=len(nodes), edges=len(edges))
         return nodes, edges
 
     @staticmethod
@@ -1032,7 +1504,97 @@ class GraphRAGEngine:
         #               nodes.append({"node_id": f"dbx_cluster_{cluster_id}", "node_type": "component", "name": cluster_id})
         #               edges.append({"source_id": f"dbx_{job['job_id']}", "target_id": f"dbx_cluster_{cluster_id}", "relationship": "RUNS_ON"})
 
-        logger.info("graphrag_databricks_extraction_stub", msg="Implement with real Databricks client")
+        # R9: Implement real Databricks dependency extraction
+        try:
+            # Support both SDK-style (jobs.list()) and REST dict style ({"jobs": [...]})
+            jobs_response = databricks_client.jobs.list()
+            if hasattr(jobs_response, "__iter__") and not isinstance(jobs_response, dict):
+                jobs_iter = jobs_response
+            else:
+                jobs_iter = jobs_response.get("jobs", [])
+
+            for job in jobs_iter:
+                job_id = str(getattr(job, "job_id", None) or job.get("job_id", ""))
+                settings = getattr(job, "settings", None) or job.get("settings", {})
+                job_name = (
+                    getattr(settings, "name", None)
+                    or (settings.get("name", "") if isinstance(settings, dict) else "")
+                    or f"job_{job_id}"
+                )
+                job_node_id = f"dbx_{job_id}"
+                nodes.append({"node_id": job_node_id, "node_type": "pipeline", "name": job_name})
+
+                tasks = (
+                    getattr(settings, "tasks", None)
+                    or (settings.get("tasks", []) if isinstance(settings, dict) else [])
+                    or []
+                )
+                for task in tasks:
+                    task_key = (
+                        getattr(task, "task_key", None)
+                        or (task.get("task_key", "") if isinstance(task, dict) else "")
+                    )
+                    if not task_key:
+                        continue
+
+                    task_node_id = f"dbx_{job_id}_{task_key}"
+
+                    # Task-level dependencies
+                    depends_on = (
+                        getattr(task, "depends_on", None)
+                        or (task.get("depends_on", []) if isinstance(task, dict) else [])
+                        or []
+                    )
+                    for dep in depends_on:
+                        dep_key = (
+                            getattr(dep, "task_key", None)
+                            or (dep.get("task_key", "") if isinstance(dep, dict) else "")
+                        )
+                        if dep_key:
+                            edges.append({
+                                "source_id": f"dbx_{job_id}_{dep_key}",
+                                "target_id": task_node_id,
+                                "relationship": "FEEDS_INTO",
+                            })
+
+                    # Notebook references (notebook_task)
+                    notebook_task = (
+                        getattr(task, "notebook_task", None)
+                        or (task.get("notebook_task", {}) if isinstance(task, dict) else {})
+                    )
+                    if notebook_task:
+                        notebook_path = (
+                            getattr(notebook_task, "notebook_path", None)
+                            or (notebook_task.get("notebook_path", "") if isinstance(notebook_task, dict) else "")
+                        )
+                        if notebook_path:
+                            nb_id = f"dbx_nb_{notebook_path.replace('/', '_').strip('_')}"
+                            nodes.append({"node_id": nb_id, "node_type": "component", "name": notebook_path})
+                            edges.append({"source_id": task_node_id, "target_id": nb_id, "relationship": "RUNS_NOTEBOOK"})
+
+                    # Cluster references
+                    cluster_id = (
+                        getattr(task, "existing_cluster_id", None)
+                        or (task.get("existing_cluster_id", "") if isinstance(task, dict) else "")
+                    )
+                    if not cluster_id:
+                        new_cluster = (
+                            getattr(task, "new_cluster", None)
+                            or (task.get("new_cluster", {}) if isinstance(task, dict) else {})
+                        )
+                        cluster_id = (
+                            getattr(new_cluster, "cluster_name", None)
+                            or (new_cluster.get("cluster_name", "") if isinstance(new_cluster, dict) else "")
+                        )
+                    if cluster_id:
+                        cluster_node_id = f"dbx_cluster_{cluster_id}"
+                        nodes.append({"node_id": cluster_node_id, "node_type": "component", "name": cluster_id})
+                        edges.append({"source_id": task_node_id, "target_id": cluster_node_id, "relationship": "RUNS_ON"})
+
+        except Exception as e:
+            logger.warning("graphrag_databricks_extraction_partial", error=str(e))
+
+        logger.info("graphrag_databricks_extracted", nodes=len(nodes), edges=len(edges))
         return nodes, edges
 
     @staticmethod
@@ -1066,7 +1628,119 @@ class GraphRAGEngine:
         #               nodes.append({"node_id": pool_id, "node_type": "component", "name": activity.sql_pool.reference_name})
         #               edges.append({"source_id": f"syn_{pipeline.name}", "target_id": pool_id, "relationship": "RUNS_ON"})
 
-        logger.info("graphrag_synapse_extraction_stub", msg="Implement with real Synapse client")
+        # R9: Implement real Synapse dependency extraction
+        try:
+            # Support both SDK client and paginated response styles
+            pipelines_response = synapse_client.pipeline.get_pipelines_by_workspace()
+            pipeline_iter = (
+                pipelines_response
+                if hasattr(pipelines_response, "__iter__")
+                else pipelines_response.get("value", [])
+            )
+
+            for pipeline in pipeline_iter:
+                pipeline_name = (
+                    getattr(pipeline, "name", None)
+                    or (pipeline.get("name", "") if isinstance(pipeline, dict) else "")
+                )
+                if not pipeline_name:
+                    continue
+
+                pipeline_node_id = f"syn_{pipeline_name}"
+                nodes.append({"node_id": pipeline_node_id, "node_type": "pipeline", "name": pipeline_name})
+
+                # Extract pipeline properties
+                props = (
+                    getattr(pipeline, "properties", None)
+                    or (pipeline.get("properties", {}) if isinstance(pipeline, dict) else {})
+                    or {}
+                )
+                activities = (
+                    getattr(props, "activities", None)
+                    or (props.get("activities", []) if isinstance(props, dict) else [])
+                    or []
+                )
+
+                for activity in activities:
+                    act_name = (
+                        getattr(activity, "name", None)
+                        or (activity.get("name", "") if isinstance(activity, dict) else "")
+                    )
+                    if not act_name:
+                        continue
+                    act_node_id = f"syn_{pipeline_name}_{act_name}"
+
+                    # Intra-pipeline activity dependencies
+                    depends_on = (
+                        getattr(activity, "depends_on", None)
+                        or (activity.get("dependsOn", []) if isinstance(activity, dict) else [])
+                        or []
+                    )
+                    for dep in depends_on:
+                        dep_act = (
+                            getattr(dep, "activity", None)
+                            or (dep.get("activity", "") if isinstance(dep, dict) else "")
+                        )
+                        if dep_act:
+                            edges.append({
+                                "source_id": f"syn_{pipeline_name}_{dep_act}",
+                                "target_id": act_node_id,
+                                "relationship": "FEEDS_INTO",
+                            })
+
+                    # Dedicated SQL pool references
+                    sql_pool = (
+                        getattr(activity, "sql_pool", None)
+                        or (activity.get("sqlPool", {}) if isinstance(activity, dict) else {})
+                    )
+                    if sql_pool:
+                        pool_ref = (
+                            getattr(sql_pool, "reference_name", None)
+                            or (sql_pool.get("referenceName", "") if isinstance(sql_pool, dict) else "")
+                        )
+                        if pool_ref:
+                            pool_id = f"syn_pool_{pool_ref}"
+                            nodes.append({"node_id": pool_id, "node_type": "component", "name": pool_ref})
+                            edges.append({"source_id": pipeline_node_id, "target_id": pool_id, "relationship": "RUNS_ON"})
+
+                    # Dataset references
+                    for ref_attr in ["inputs", "outputs", "dataset"]:
+                        refs = (
+                            getattr(activity, ref_attr, None)
+                            or (activity.get(ref_attr, []) if isinstance(activity, dict) else [])
+                            or []
+                        )
+                        if isinstance(refs, dict):
+                            refs = [refs]
+                        for ref in refs:
+                            ref_name = (
+                                getattr(ref, "reference_name", None)
+                                or (
+                                    ref.get("referenceName", "")
+                                    or ref.get("datasetName", "")
+                                    if isinstance(ref, dict) else ""
+                                )
+                            )
+                            if ref_name:
+                                ds_id = f"syn_dataset_{ref_name}"
+                                nodes.append({"node_id": ds_id, "node_type": "component", "name": ref_name})
+                                rel = "WRITES_TO" if ref_attr == "outputs" else "READS_FROM"
+                                edges.append({"source_id": pipeline_node_id, "target_id": ds_id, "relationship": rel})
+
+                # Extract pipeline-level parameters for linked service detection
+                linked_service_name = (
+                    getattr(pipeline, "linked_service_name", None)
+                    or (props.get("linkedServiceName", {}).get("referenceName", "") if isinstance(props, dict) else "")
+                )
+                if linked_service_name:
+                    ls_id = f"syn_ls_{linked_service_name}"
+                    nodes.append({"node_id": ls_id, "node_type": "component", "name": linked_service_name})
+                    edges.append({"source_id": pipeline_node_id, "target_id": ls_id, "relationship": "USES_CONNECTION"})
+
+        except Exception as e:
+            logger.warning("graphrag_synapse_extraction_partial", error=str(e))
+
+        logger.info("graphrag_synapse_extracted", nodes=len(nodes), edges=len(edges))
         return nodes, edges
 
     def _build_default_graph(self) -> None:
@@ -1324,6 +1998,64 @@ class AgenticRAGOrchestrator:
                 "retrieval_mode": "keyword",
             },
         }
+        # R16: Per-source retrieval success rate tracking for confidence-weighted routing
+        # Each entry: {"attempts": int, "hits": int, "avg_score": float}
+        self._source_stats: dict[str, dict[str, Any]] = {
+            src: {"attempts": 0, "hits": 0, "avg_score": 0.0}
+            for src in self._source_capabilities
+        }
+
+    def get_source_confidence(self, source: str) -> float:
+        """
+        R16: Return a confidence score (0.0–1.0) for a source based on
+        historical retrieval success rates.
+
+        New / unseen sources get a neutral score of 0.5 (explore-first).
+        Sources with high hit rates and high average scores get scores > 0.5.
+        Sources that consistently fail get scores < 0.5.
+        """
+        stats = self._source_stats.get(source)
+        if not stats or stats["attempts"] == 0:
+            return 0.5  # Neutral confidence for unseen sources
+
+        hit_rate = stats["hits"] / stats["attempts"]
+        avg_score = stats["avg_score"]
+        # Weighted combination: hit_rate matters more than avg_score
+        confidence = 0.6 * hit_rate + 0.4 * avg_score
+        return round(min(max(confidence, 0.0), 1.0), 4)
+
+    def record_retrieval_outcome(
+        self,
+        source: str,
+        chunks_found: int,
+        avg_relevance_score: float,
+    ) -> None:
+        """
+        R16: Record the outcome of a retrieval attempt for confidence tracking.
+
+        Args:
+            source: Source type that was queried (e.g. 'confluence', 'icm')
+            chunks_found: Number of relevant chunks returned
+            avg_relevance_score: Average similarity/relevance score of returned chunks
+        """
+        if source not in self._source_stats:
+            self._source_stats[source] = {"attempts": 0, "hits": 0, "avg_score": 0.0}
+
+        stats = self._source_stats[source]
+        stats["attempts"] += 1
+        if chunks_found > 0:
+            stats["hits"] += 1
+        # Exponential moving average for score
+        alpha = 0.3  # Weight for new observation
+        stats["avg_score"] = (1 - alpha) * stats["avg_score"] + alpha * avg_relevance_score
+
+        logger.debug(
+            "source_confidence_updated",
+            source=source,
+            confidence=self.get_source_confidence(source),
+            hit_rate=stats["hits"] / stats["attempts"],
+            attempts=stats["attempts"],
+        )
 
     def plan_retrieval(
         self,
@@ -1460,6 +2192,18 @@ class AgenticRAGOrchestrator:
                     source_type=source if source != "log_analytics" else None,
                     use_hybrid=step.get("use_hybrid", False),
                 )
+                # R16: Record retrieval outcome for confidence tracking
+                src_chunks = result.chunks
+                avg_score = (
+                    sum(float(c.metadata.get("similarity_score", 0.5)) for c in src_chunks)
+                    / max(len(src_chunks), 1)
+                ) if src_chunks else 0.0
+                self.record_retrieval_outcome(
+                    source=source,
+                    chunks_found=len(src_chunks),
+                    avg_relevance_score=avg_score,
+                )
+
                 total_time += result.retrieval_time_ms
 
                 for chunk in result.chunks:

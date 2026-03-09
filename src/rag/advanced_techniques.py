@@ -27,6 +27,7 @@ These are the NEW techniques added to the Alert Whisperer RAG pipeline:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import defaultdict
@@ -96,12 +97,15 @@ class CrossEncoderReranker:
         top_n: int = 5,
         use_dedicated_model: bool = False,
         dedicated_model_path: Optional[str] = None,
+        latency_budget_ms: int = 3000,
     ):
         self.llm_client = llm_client
         self.model = model
         self.top_n = top_n
         self.use_dedicated_model = use_dedicated_model
         self._dedicated_model: Optional[Any] = None
+        # R5: configurable latency budget for LLM-as-reranker path (default 3000ms)
+        self.latency_budget_ms = latency_budget_ms
 
         if use_dedicated_model:
             self._load_dedicated_model(dedicated_model_path)
@@ -216,19 +220,20 @@ class CrossEncoderReranker:
         )
         return result
 
-    async def _llm_rerank(
+    async def _llm_rerank_single(
         self,
         query: str,
-        chunks: list[DocumentChunk],
-    ) -> list[tuple[float, DocumentChunk]]:
-        """Score each chunk using LLM cross-encoder."""
-        scored = []
-        for chunk in chunks:
-            try:
-                prompt = self.RERANK_PROMPT.format(
-                    query=query[:300],
-                    document=chunk.content[:800],
-                )
+        chunk: DocumentChunk,
+    ) -> tuple[float, DocumentChunk]:
+        """Score a single chunk using LLM cross-encoder, enforcing latency budget."""
+        timeout_s = self.latency_budget_ms / 1000.0
+        try:
+            prompt = self.RERANK_PROMPT.format(
+                query=query[:300],
+                document=chunk.content[:800],
+            )
+
+            async def _call() -> tuple[float, DocumentChunk]:
                 response = await self.llm_client.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
@@ -242,15 +247,36 @@ class CrossEncoderReranker:
                     score = float(result.get("score", 0.5))
                     chunk.metadata["reranker_score"] = round(score, 4)
                     chunk.metadata["reranker_reason"] = result.get("reason", "")
-                    scored.append((score, chunk))
-                else:
-                    scored.append((0.5, chunk))
-            except Exception as e:
-                logger.warning("llm_rerank_error", error=str(e), chunk_id=chunk.chunk_id)
-                # Fallback to existing score
-                existing = float(chunk.metadata.get("similarity_score", 0.5))
-                scored.append((existing, chunk))
+                    return (score, chunk)
+                return (0.5, chunk)
 
+            return await asyncio.wait_for(_call(), timeout=timeout_s)
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                "llm_rerank_timeout",
+                chunk_id=chunk.chunk_id,
+                latency_budget_ms=self.latency_budget_ms,
+            )
+            # Latency budget exceeded — fall back to existing score
+            existing = float(chunk.metadata.get("similarity_score", 0.5))
+            chunk.metadata["reranker_method"] = "heuristic_timeout_fallback"
+            return (existing, chunk)
+        except Exception as e:
+            logger.warning("llm_rerank_error", error=str(e), chunk_id=chunk.chunk_id)
+            existing = float(chunk.metadata.get("similarity_score", 0.5))
+            return (existing, chunk)
+
+    async def _llm_rerank(
+        self,
+        query: str,
+        chunks: list[DocumentChunk],
+    ) -> list[tuple[float, DocumentChunk]]:
+        """Score each chunk using LLM cross-encoder with per-chunk latency budget."""
+        scored = []
+        for chunk in chunks:
+            result = await self._llm_rerank_single(query, chunk)
+            scored.append(result)
         return scored
 
     def _heuristic_rerank(
@@ -424,7 +450,6 @@ class QueryRewriter:
             if short in query_lower:
                 # Append expansion rather than replace (keeps original context)
                 result = f"{result} {long}"
-                break  # Only expand the first match to avoid bloat
         return result
 
     def _expand_abbreviations(self, query: str) -> str:
@@ -475,7 +500,7 @@ class QueryRewriter:
             response = await self.llm_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
+                temperature=0.0,
                 max_tokens=200,
             )
             rewritten = (response.choices[0].message.content or "").strip()
@@ -516,7 +541,7 @@ class RAGFusion:
     4. Return top-K documents by fused score
     """
 
-    RRF_K = 60  # RRF constant (standard value from the original paper)
+    RRF_K = 60  # RRF constant default (standard value from the original paper)
 
     FUSION_PROMPT = (
         "You are a search query decomposition assistant.\n\n"
@@ -533,10 +558,12 @@ class RAGFusion:
         vector_store: Any = None,
         llm_client: Any = None,
         num_variants: int = 3,
+        rrf_k: int = 60,
     ):
         self.vector_store = vector_store
         self.llm_client = llm_client
         self.num_variants = num_variants
+        self.rrf_k = rrf_k  # R4: configurable RRF k (default 60, increase for large result sets)
 
     async def generate_query_variants(self, query: str) -> list[str]:
         """
@@ -575,7 +602,7 @@ class RAGFusion:
 
         for ranked_list in ranked_lists:
             for rank, chunk in enumerate(ranked_list):
-                rrf_scores[chunk.chunk_id] += 1.0 / (self.RRF_K + rank + 1)
+                rrf_scores[chunk.chunk_id] += 1.0 / (self.rrf_k + rank + 1)
                 if chunk.chunk_id not in chunk_map:
                     chunk_map[chunk.chunk_id] = chunk
 
@@ -650,7 +677,7 @@ class RAGFusion:
             response = await self.llm_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
+                temperature=0.3,
                 max_tokens=300,
             )
             text = response.choices[0].message.content or ""
@@ -730,17 +757,31 @@ class SelfRAG:
         "\"retrieval_query\": \"<query if needs_retrieval=yes, else empty>\"}}"
     )
 
+    # R7: Per-source-type relevance thresholds
+    # Runbooks (confluence): lenient — partial matches are valuable
+    # Incidents (icm): strict — false-positive incident matches are costly
+    DEFAULT_SOURCE_THRESHOLDS: dict[str, float] = {
+        "confluence": 0.4,
+        "icm": 0.7,
+    }
+
     def __init__(
         self,
         llm_client: Any = None,
         vector_store: Any = None,
         confidence_threshold: float = 0.6,
         max_retrieval_rounds: int = 2,
+        source_thresholds: Optional[dict[str, float]] = None,
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
         self.confidence_threshold = confidence_threshold
         self.max_retrieval_rounds = max_retrieval_rounds
+        # R7: Per-source-type thresholds override the global confidence_threshold
+        self.source_thresholds: dict[str, float] = (
+            source_thresholds if source_thresholds is not None
+            else dict(self.DEFAULT_SOURCE_THRESHOLDS)
+        )
 
     async def evaluate_and_enhance(
         self,
@@ -867,6 +908,46 @@ class SelfRAG:
         )
 
         return result
+
+    def get_threshold_for_source(self, source_type: str) -> float:
+        """
+        R7: Return the relevance threshold for a given source type.
+
+        Runbooks (confluence) use a lower threshold (0.4) because partial
+        matches are useful starting points for engineers.
+        Incidents (icm) use a higher threshold (0.7) to avoid false positives
+        from unrelated historical incidents.
+        Falls back to the global confidence_threshold for unlisted source types.
+        """
+        return self.source_thresholds.get(source_type.lower(), self.confidence_threshold)
+
+    def filter_chunks_by_source_threshold(
+        self,
+        chunks: list[DocumentChunk],
+    ) -> list[DocumentChunk]:
+        """
+        R7: Filter retrieved chunks by per-source-type relevance thresholds.
+
+        Applies source-specific thresholds from self.source_thresholds.
+        Chunks whose similarity_score falls below their source's threshold
+        are excluded from the returned list.
+        """
+        filtered = []
+        for chunk in chunks:
+            source = chunk.source_type.lower()
+            threshold = self.get_threshold_for_source(source)
+            score = float(chunk.metadata.get("similarity_score", 1.0))
+            if score >= threshold:
+                filtered.append(chunk)
+            else:
+                logger.debug(
+                    "self_rag_chunk_filtered",
+                    chunk_id=chunk.chunk_id,
+                    source_type=source,
+                    score=score,
+                    threshold=threshold,
+                )
+        return filtered
 
     async def _evaluate_segment(
         self,

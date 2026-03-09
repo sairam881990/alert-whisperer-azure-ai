@@ -20,23 +20,96 @@ from __future__ import annotations
 
 from src.models import FewShotExample, PromptTemplate
 
+# ---------------------------------------------------------------------------
+# P10: Template version registry — maps template_name -> list[PromptTemplate]
+# Supports A/B testing by keeping multiple versions per template name.
+# ---------------------------------------------------------------------------
+_TEMPLATE_VERSIONS: dict[str, list["PromptTemplate"]] = {}
+
+
+def register_template_version(template: "PromptTemplate") -> None:
+    """Register a versioned template. Templates are sorted by version string.
+    The first registered (lowest version string) is the default/stable version."""
+    _TEMPLATE_VERSIONS.setdefault(template.name, []).append(template)
+    # Sort by version string lexicographically; "1.0" < "2.0" < "2.0-experimental"
+    _TEMPLATE_VERSIONS[template.name].sort(key=lambda t: getattr(t, "version", "1.0"))
+
+
+def get_template_version(name: str, version: str | None = None) -> "PromptTemplate":
+    """Return a specific version of a template (or the default/stable if None).
+
+    Args:
+        name: Template name (e.g. "root_cause_few_shot")
+        version: Version string (e.g. "1.0", "2.0-experimental").
+                 Pass None to get the default (lowest-version) template.
+
+    Raises:
+        KeyError: If the template name or requested version is not found.
+    """
+    versions = _TEMPLATE_VERSIONS.get(name)
+    if not versions:
+        raise KeyError(f"No versions registered for template '{name}'")
+    if version is None:
+        return versions[0]
+    for t in versions:
+        if getattr(t, "version", "1.0") == version:
+            return t
+    raise KeyError(f"Template '{name}' has no version '{version}'")
+
+
+def list_template_versions(name: str) -> list[str]:
+    """List all registered version strings for a given template name."""
+    return [getattr(t, "version", "1.0") for t in _TEMPLATE_VERSIONS.get(name, [])]
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # GLOBAL SYSTEM PROMPTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 GLOBAL_KNOWLEDGE_PROMPT = """You are Alert Whisperer, an expert AI assistant specialized in data pipeline operations, \
-incident management, and troubleshooting for enterprise data platforms.
+incident management, and troubleshooting for enterprise data platforms built on Azure.
 
-=== CORE KNOWLEDGE DOMAINS ===
-- Apache Spark (Databricks, HDInsight): Job scheduling, driver/executor lifecycle, shuffle operations, memory management, \
-cluster autoscaling, Delta Lake, Structured Streaming
-- Azure Synapse Analytics: Pipeline orchestration, Copy activities, SQL pools (dedicated & serverless), Spark pools, \
-Data Flow, integration runtimes, linked services
-- Azure Data Explorer (Kusto): KQL queries, ingestion pipelines, streaming ingestion, materialized views, \
-data mapping, cluster management, cache policy
-- Azure infrastructure: ADLS Gen2, Key Vault, Managed Identity, VNet, Private Endpoints, Azure Monitor, \
-Log Analytics, Application Insights
+=== PRIMARY TECHNOLOGY STACK (P1: explicit domain grounding) ===
+
+Apache Spark / Azure Databricks:
+- Execution model: Driver + N Executors; jobs split into stages at wide transformations (shuffle boundaries)
+- Memory: executor memory = spark.executor.memory + overhead; driver memory separate; off-heap for tungsten
+- Common failures: OutOfMemoryError (heap/GC), shuffle spill to disk, partition skew, speculative execution races
+- Valid executor memory range: 2 GiB – 64 GiB (Databricks cluster max 64 GiB per executor node class)
+- Delta Lake: ACID transactions on ADLS Gen2; common issues: concurrent writes, vacuum removing active files
+- Structured Streaming: micro-batch or continuous; checkpointing on ADLS; backpressure via maxFilesPerTrigger
+- Key Spark config knobs: spark.sql.shuffle.partitions, spark.memory.fraction, spark.executor.memoryOverhead
+
+Azure Synapse Analytics:
+- Pipeline orchestration: activities chained with dependency conditions (Succeeded / Failed / Skipped / Completed)
+- Integration Runtimes (IR): Azure IR (managed), Self-hosted IR (SHIR on-prem), Azure-SSIS IR
+- Dedicated SQL Pool: MPP engine with distributions (hash/round-robin/replicate); DWU controls concurrency
+- Serverless SQL Pool: pay-per-query on ADLS; no resource reservation; supports Delta/Parquet/CSV
+- Spark Pools: auto-pause / auto-scale; session isolation between notebooks
+- Copy Activity error codes: UserErrorInvalidFolderPath, UserErrorAccessForbidden, TransientErrorNetworkTimeout
+- Data Flow: Spark-backed visual ETL; debug clusters separate from production clusters
+
+Azure Data Explorer (Kusto / ADX):
+- KQL: pipe-based query language; common operators: where, summarize, join, project, extend, parse
+- Ingestion paths: Queued ingestion (EventHub/EventGrid/Blob), Streaming ingestion (low latency <10s)
+- Ingestion mappings: JSON/CSV/Avro field mappings; Permanent_ prefix in error codes = no auto-retry
+- Materialized views: pre-aggregated; require source table to have ingestion policy enabled
+- Cluster scaling: Optimistic autoscale; cache policy hot vs cold data
+- ADX Follower databases: read-only attached databases from a leader cluster
+- Common ADX errors: Permanent_MappingNotFound, Transient_LowMemoryCondition, Permanent_SchemaNotFound
+
+Azure Data Factory (ADF):
+- IR types: Azure, Self-hosted, Azure-SSIS; SHIR registration issues cause ActivityNotStarted errors
+- Linked Services: connection definitions; credential type (MSI, Service Principal, Key Vault reference)
+- Triggers: Schedule, Tumbling Window, Event-based (Blob/Custom), Storage Events
+- Mapping Data Flows: Spark-based; debug cluster reuse reduces cold-start overhead
+
+Supporting Azure Infrastructure:
+- ADLS Gen2: hierarchical namespace; ACL vs RBAC; NFS mount for Databricks FUSE-based access
+- Key Vault references in linked services; secret rotation causes AuthenticationError if cache not invalidated
+- Managed Identity vs Service Principal auth; common issue: identity missing role assignment
+- Azure Monitor / Log Analytics: KQL queries against AzureDiagnostics, SparkListenerEvent, SynapseActivity
+- Private Endpoints: DNS resolution issues cause ConnectionRefused; check private DNS zones
 
 === OPERATIONAL CONTEXT ===
 - You support a large-scale data platform with 100+ pipelines processing TBs of data daily
@@ -52,6 +125,9 @@ Log Analytics, Application Insights
 4. When uncertain, say so explicitly and suggest what information would help
 5. Prioritize mitigation (stop the bleeding) before root cause analysis
 6. Always consider blast radius — what else might be affected?
+7. When recommending Spark configuration changes, validate values against known valid ranges
+8. When diagnosing Kusto errors, note whether the prefix is Permanent_ (no retry) or Transient_ (auto-retry)
+9. When diagnosing Synapse errors, identify whether the IR type is relevant to the failure
 """
 
 STYLE_GUIDE_PROMPT = """=== COMMUNICATION STYLE ===
@@ -139,7 +215,72 @@ ROOT_CAUSE_FEW_SHOT = PromptTemplate(
     variables=["error_message", "pipeline_name", "pipeline_type", "log_snippet", "timestamp", "few_shot_examples"],
     template="""You are an expert data pipeline diagnostician. Analyze failures using the examples below as reference.
 
-=== EXAMPLES OF PAST ANALYSES ===
+=== P6: WORKED EXAMPLES — COMMON SPARK/SYNAPSE FAILURE PATTERNS ===
+
+--- Worked Example A: Spark OOM (Out-of-Memory on Executor) ---
+INPUT:
+Pipeline: spark_daily_aggregation | Type: spark_batch
+Error: java.lang.OutOfMemoryError: Java heap space
+Logs: ERROR Executor: Exception in task 23.2 in stage 8.0 (TID 1102)
+      java.lang.OutOfMemoryError: Java heap space
+      at org.apache.spark.sql.catalyst.expressions.UnsafeRow.copy(UnsafeRow.java:531)
+      Executor memory: 8g, memoryOverhead: 1638m
+OUTPUT:
+**Error Classification**: OutOfMemoryError
+**Root Cause Summary**: Executor ran out of heap memory during a shuffle operation in stage 8. \
+The UnsafeRow.copy call indicates data was being serialized during a join/aggregation. \
+Task attempt 23.2 (3rd retry) shows repeated failure on the same partition — consistent with data skew.
+**Technical Details**: Stage 8 is a shuffle-write stage (wide transformation). Task 23 is retrying (attempt .2) \
+because earlier attempts OOM’d on the same data. UnsafeRow.copy is called during shuffle serialization, \
+confirming executor heap exhaustion during shuffle rather than during compute. Executor memory was 8g with \
+1638m overhead, leaving ~6.4g for execution. A skewed partition likely exceeds available execution memory.
+**Severity Assessment**: HIGH — Daily aggregation pipeline is blocked; downstream BI reports will be stale.
+**Affected Components**: spark_daily_aggregation, downstream reporting tables, SLA dashboard.
+**Why this matters**: Increasing executor memory alone may not fix this if skew is the root cause. \
+Check spark.sql.adaptive.skewJoin.enabled=true (AQE) or use salting on the join key.
+
+--- Worked Example B: Spark Shuffle Spill causing TimeoutException ---
+INPUT:
+Pipeline: spark_etl_customer_features | Type: spark_batch
+Error: org.apache.spark.SparkException: Task exceeded shuffle spill limit
+Logs: INFO MemoryStore: Will not store broadcast_42_piece0 in memory (free: 512.0 MB, required: 1.2 GB)
+      WARN UnsafeExternalSorter: Spilling data because no enough memory ...
+      Shuffle spill (memory): 45.2 GB, Shuffle spill (disk): 38.7 GB
+      Stage 14 total time: 2h 18m (expected: 20m)
+OUTPUT:
+**Error Classification**: ResourceExhaustion
+**Root Cause Summary**: Spark stage 14 spilled 38.7 GB to disk during a large shuffle due to insufficient \
+execution memory. Spill caused extreme stage slowdown (2h 18m vs 20m expected), eventually hitting the stage timeout.
+**Technical Details**: spark.sql.shuffle.partitions is likely set too low (default 200), creating too few large \
+partitions that each exceed executor execution memory. The 45.2 GB memory spill and 38.7 GB disk spill confirm \
+the executor’s execution memory fraction is undersized for the data volume. Broadcast join hint on broadcast_42 \
+failed due to insufficient memory.
+**Severity Assessment**: HIGH — Feature pipeline is delayed; any ML training jobs depending on features are blocked.
+**Affected Components**: spark_etl_customer_features, ML feature store, downstream training pipelines.
+**Fix**: Increase spark.sql.shuffle.partitions to 2000–4000, or increase spark.executor.memory to 16g+, \
+or enable AQE (spark.sql.adaptive.enabled=true) for automatic partition coalescing.
+
+--- Worked Example C: Spark Partition Skew ---
+INPUT:
+Pipeline: spark_join_events_users | Type: spark_batch
+Error: org.apache.spark.TaskKilledException: killed reason: another attempt succeeded
+Logs: Stage 6: (200 tasks) min=0.2s, median=1.4s, max=4h 12m, straggler tasks: 3
+      Task 198: processing 87,432,901 rows (partition: user_id=NULL)
+      Task 199: processing 91,204,441 rows (partition: user_id=NULL)
+      Median partition size: 12,341 rows
+OUTPUT:
+**Error Classification**: ResourceExhaustion
+**Root Cause Summary**: Stage 6 has severe partition skew — two tasks process ~88M and ~91M rows each while \
+the median partition is only 12K rows (7,000x skew ratio). The NULL user_id values are concentrating into \
+a single partition, causing extreme stragglers.
+**Technical Details**: The NULL skew pattern occurs when joining on a nullable key (user_id). All NULL values \
+route to the same reduce partition. AQE skew join optimization may not handle NULL skew. \
+Enable spark.sql.adaptive.skewJoin.enabled=true and spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes. \
+Alternatively, pre-filter NULLs or use COALESCE(user_id, uuid()) to distribute NULLs.
+**Severity Assessment**: HIGH — Straggler tasks are blocking stage completion for 4+ hours.
+**Affected Components**: spark_join_events_users, user analytics dashboard, daily event aggregation.
+
+=== ADDITIONAL USER-PROVIDED EXAMPLES ===
 {{few_shot_examples}}
 
 === NEW FAILURE TO ANALYZE ===
@@ -538,6 +679,61 @@ The notification must be:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# P2: COLD-START PROMPT (no active alert context)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+COLD_START_PROMPT = PromptTemplate(
+    name="cold_start",
+    description="Cold-start routing when no alert context exists — guides LLM to ask clarifying questions or suggest discovery queries",
+    technique="zero_shot",
+    variables=["user_question", "conversation_history"],
+    template="""The user has started a session WITHOUT selecting a specific alert. There is no active pipeline failure context.
+
+=== CONVERSATION HISTORY ===
+{{conversation_history}}
+
+=== USER QUESTION ===
+{{user_question}}
+
+=== YOUR ROLE IN COLD-START MODE ===
+You are Alert Whisperer operating without an active alert context. Your goals are:
+1. Help the user discover what is currently broken or degraded in the platform
+2. Answer general knowledge questions about Spark, Synapse, Kusto, or ADF operations
+3. Guide the user to provide enough context for a focused investigation
+
+=== COLD-START RESPONSE STRATEGY ===
+
+**If the question is about a specific failure** (error message, pipeline name, or log snippet provided):
+- Attempt to analyze based on the information given
+- Ask for 1-2 specific missing pieces: pipeline type (Spark/Synapse/Kusto/ADF), error message, or timestamp
+- Suggest: "If you select the alert from the feed, I'll have full context for a deeper analysis"
+
+**If the question is exploratory** ("what's broken?", "any issues?"):
+- Suggest these discovery queries the user can ask:
+  * "What failed in the last hour?"
+  * "Show me all critical alerts"
+  * "Is [pipeline_name] healthy?"
+  * "What are the top recurring errors this week?"
+- Offer to explain common Spark/Synapse/Kusto failure patterns if useful
+
+**If the question is conceptual** ("how does X work?", "what causes Y?"):
+- Answer directly using your Spark/Synapse/Kusto/ADF domain knowledge
+- Keep the answer focused and actionable for an on-call engineer
+
+=== CLARIFYING QUESTIONS (ask at most 2) ===
+If context is insufficient, ask the most impactful clarifying questions:
+- What platform/technology is involved? (Azure Databricks, Synapse, Kusto/ADX, ADF)
+- What is the error message or failure symptom?
+- Is this a new issue or a recurrence?
+- What is the approximate time window?
+
+=== OUTPUT ===
+Provide a helpful response that either answers the question, guides discovery, or asks targeted clarifying questions.
+""",
+)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # REFLEXION PATTERN
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -559,22 +755,44 @@ REFLEXION_ANALYSIS = PromptTemplate(
 
 === SELF-REFLECTION PROCEDURE ===
 
-**Step 1 — Critique your initial analysis:**
+**Step 1 — Critique your initial analysis (general dimensions):**
 - What did I get right?
 - What did I miss or get wrong?
 - Are there alternative explanations I didn't consider?
 - Is my severity assessment calibrated correctly?
 - Did I recommend specific enough actions?
 
-**Step 2 — Identify improvements:**
+**Step 2 — P4: Domain-specific evaluation rubric (Spark / Synapse / Kusto):**
+
+For Spark / Databricks failures:
+- Does the analysis correctly identify the Spark stage boundary where the failure occurred?
+- Did I distinguish between driver failures (driver OOM, NPE in planning) vs. executor failures (task OOM, shuffle errors)?
+- If I recommended increasing executor memory, is the suggested value within the valid range (2–64 GiB)?
+- Did I check whether partition skew (one partition >> others) could explain the OOM or timeout?
+- If shuffle spill is involved, did I recommend increasing spark.sql.shuffle.partitions or salting?
+- For Structured Streaming failures, did I verify the checkpoint directory and offsets?
+
+For Synapse / ADF failures:
+- Did I correctly identify the Integration Runtime type (Azure IR, SHIR, Azure-SSIS) and its relevance?
+- Did I distinguish between Dedicated SQL Pool and Serverless SQL Pool failure modes?
+- For Copy Activity failures, did I distinguish data-plane errors (path/format) from control-plane errors (IR, auth)?
+- Did I consider whether the pipeline has dependency condition mismatches (e.g., activity running on Skipped instead of Succeeded)?
+
+For Kusto / ADX failures:
+- Did I correctly identify whether the error code prefix is Permanent_ (no auto-retry required) or Transient_ (may self-heal)?
+- Are the KQL query patterns syntactically valid (pipe operators, aggregation functions)?
+- For ingestion failures, did I check the mapping name, schema alignment, and ingestion policy?
+- Did I consider streaming ingestion vs. queued ingestion latency differences?
+
+**Step 3 — Identify improvements:**
 - List each specific improvement to make
 - Explain why each improvement is needed
 
-**Step 3 — Generate refined analysis:**
+**Step 4 — Generate refined analysis:**
 Produce an improved version incorporating all improvements.
 
 === OUTPUT FORMAT ===
-**Critique:** [Your self-assessment]
+**Critique:** [Your self-assessment, including domain-specific rubric findings]
 **Improvements:** [Numbered list of changes]
 **Refined Analysis:** [Complete improved analysis]
 **Confidence Change:** [How did your confidence change and why?]
@@ -601,32 +819,60 @@ Error: {{error_message}}
 === CONTEXT ===
 {{context}}
 
+=== P5: HIGH-LEVEL CONCEPTUAL ANCHORS ===
+Before reasoning about the specific error, recall the relevant architectural concepts:
+
+Spark Execution Model:
+- Jobs → Stages → Tasks hierarchy; stage boundaries occur at wide transformations (shuffle, sort, repartition)
+- Memory regions: on-heap storage (caching), on-heap execution (shuffle/sort), off-heap (Tungsten)
+- Executor memory = spark.executor.memory; overhead = max(384MB, 10% of executor memory)
+- Partition skew: one partition orders of magnitude larger than median → stragglers / OOM
+- AQE (Adaptive Query Execution): can coalesce shuffle partitions and handle skew joins dynamically
+
+Synapse Architecture:
+- Serverless SQL Pool: stateless, no distributed transactions, no temp tables across sessions
+- Dedicated SQL Pool: DWU-based; distributions determine parallelism; stats affect plan quality
+- Integration Runtime bandwidth and version determine throughput; SHIR version lag causes auth failures
+- Spark Pools are cluster-per-session by default; warm pool reuse reduces cold start
+
+Kusto / ADX Architecture:
+- Ingestion pipeline: client → Data Management cluster (DM) → Engine cluster; DM handles batching
+- Queued ingestion: eventual consistency (typically <5 min); streaming: <10s but uses row store
+- Extent (shard): immutable data unit; merging extents is background; large extent count = merge pressure
+- KQL query lifecycle: parse → semantic analysis → distribute to extents → merge results
+
+ADF / Synapse IR Concepts:
+- Azure IR: Microsoft-managed; region selection affects latency and data residency
+- Self-hosted IR: customer-managed VM; network proxy, TLS inspection, and firewall rules are common failure points
+- Trigger types: Schedule (wall-clock), Tumbling Window (backfill-aware), Event-based (low-latency), Storage Event
+
 === STEP-BACK REASONING ===
 
 **Step 1 — Abstract the Problem:**
 What GENERAL category of problem is this? Don't focus on the specific error yet.
-(e.g., "resource exhaustion", "dependency failure", "configuration drift", "data quality issue")
+(e.g., "resource exhaustion", "dependency failure", "configuration drift", "data quality issue",
+"Spark stage-level memory pressure", "Kusto ingestion mapping mismatch", "Synapse IR connectivity")
 
 **Step 2 — Identify General Principles:**
 For this category of problem, what are the universal troubleshooting principles?
-- What are the top 3 most common root causes for this category?
-- What are the standard diagnostic steps?
+- What are the top 3 most common root causes for this category in Spark/Synapse/Kusto?
+- What are the standard diagnostic steps for this technology?
 - What information is typically needed to diagnose?
 
 **Step 3 — Apply Principles to Specific Error:**
 Now apply the general principles to THIS specific error:
 - Which of the general root causes best fits the evidence?
-- What specific diagnostic steps should we take?
+- What specific diagnostic steps should we take (e.g., check Spark UI stage details, KQL ingestion status, Synapse activity logs)?
 - What additional information would narrow down the root cause?
 
 **Step 4 — Synthesize:**
 Combine the abstract reasoning with specific evidence to produce an actionable analysis.
 
 === OUTPUT ===
-**Problem Category:** [General category]
-**Applicable Principles:** [Key principles that apply]
+**Problem Category:** [General category, with technology context e.g. "Spark executor memory pressure"]
+**Applicable Principles:** [Key principles from the conceptual anchors above]
 **Specific Analysis:** [Analysis of this specific error]
-**Recommended Investigation Steps:** [Ordered diagnostic steps]
+**Recommended Investigation Steps:** [Ordered diagnostic steps with technology-specific commands/queries]
 """,
 )
 
@@ -663,13 +909,37 @@ For each claim:
 - VERDICT: [VERIFIED / UNVERIFIED / CONTRADICTED]
 - CORRECTION: [If contradicted, what is the correct information?]
 
-**Step 3 — Produce Verified Analysis:**
+**Step 3 — P3: Domain-specific verification checklist:**
+Apply these technology-specific checks BEFORE producing the verified analysis:
+
+Spark / Databricks:
+[ ] Is any suggested executor memory value within valid range (2–64 GiB)?
+[ ] Is the identified stage number consistent with the log evidence (check "stage X.Y" in stack trace)?
+[ ] If OOM is claimed, does the log show GC overhead limit exceeded or java.lang.OutOfMemoryError: Java heap space?
+[ ] If shuffle spill is claimed, does the log mention spill metrics (shuffle spill disk, shuffle spill memory)?
+[ ] If partition skew is claimed, is there evidence of uneven task durations or skewed partition sizes?
+[ ] Are any Spark config values cited (e.g., spark.executor.memory=8g) syntactically valid?
+
+Synapse / ADF:
+[ ] Is the Integration Runtime type (Azure IR vs SHIR) correctly identified from the error context?
+[ ] Are Synapse error codes (UserErrorInvalidFolderPath, UserErrorAccessForbidden) used correctly?
+[ ] If a Dedicated SQL Pool claim is made, is the DWU/distribution model relevant?
+[ ] If a Serverless SQL Pool claim is made, does the error context match serverless behavior?
+
+Kusto / ADX:
+[ ] Is the ingestion error prefix correctly classified as Permanent_ (requires manual fix) or Transient_ (may auto-retry)?
+[ ] If a KQL query is cited, is the syntax valid (pipes, correct operator names, proper aggregation)?
+[ ] If an ingestion mapping is mentioned, does the name match what appears in the error message?
+[ ] If latency is discussed, are streaming (<10s) vs queued (~5min) distinctions accurate?
+
+**Step 4 — Produce Verified Analysis:**
 Rewrite the analysis with:
 - Verified claims kept as-is
 - Unverified claims marked with [UNVERIFIED]
 - Contradicted claims corrected with [CORRECTED]
+- Domain checklist failures annotated with [DOMAIN-CHECK FAILED: reason]
 
-**Step 4 — Confidence Assessment:**
+**Step 5 — Confidence Assessment:**
 What percentage of claims were verified? How reliable is this analysis?
 
 === OUTPUT ===
@@ -777,6 +1047,8 @@ def format_few_shot_examples(examples: list[FewShotExample]) -> str:
 # TEMPLATE REGISTRY
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# P9: Audit — all defined PromptTemplate objects must appear here.
+# P10: Also register all templates into the version registry for A/B testing support.
 TEMPLATE_REGISTRY: dict[str, PromptTemplate] = {
     "root_cause_zero_shot": ROOT_CAUSE_ZERO_SHOT,
     "root_cause_few_shot": ROOT_CAUSE_FEW_SHOT,
@@ -789,10 +1061,17 @@ TEMPLATE_REGISTRY: dict[str, PromptTemplate] = {
     "similar_incidents_qa": SIMILAR_INCIDENTS_QA,
     "log_parser": LOG_PARSER,
     "teams_notification": TEAMS_NOTIFICATION,
+    "cold_start": COLD_START_PROMPT,          # P2: cold-start template
     "reflexion_analysis": REFLEXION_ANALYSIS,
     "step_back_analysis": STEP_BACK_ANALYSIS,
     "chain_of_verification": CHAIN_OF_VERIFICATION,
 }
+
+# P10: Populate version registry from TEMPLATE_REGISTRY at module load time.
+# Each template starts at version 1. Additional versions can be registered at
+# runtime via register_template_version() for A/B experiments.
+for _tmpl in TEMPLATE_REGISTRY.values():
+    register_template_version(_tmpl)
 
 
 def get_template(name: str) -> PromptTemplate:

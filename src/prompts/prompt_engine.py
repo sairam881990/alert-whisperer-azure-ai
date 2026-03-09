@@ -18,10 +18,11 @@ Uses Pydantic AI patterns for type-safe prompting.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import hashlib
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import structlog
 from pydantic import BaseModel, Field
@@ -40,6 +41,7 @@ from src.models import (
     VerificationClaim,
 )
 from src.prompts.templates import (
+    COLD_START_PROMPT,
     CURATED_FEW_SHOT_EXAMPLES,
     GLOBAL_KNOWLEDGE_PROMPT,
     SOLUTION_PROMPT,
@@ -89,6 +91,176 @@ class SeverityOutput(BaseModel):
 # DSPy-Style Prompt Optimizer
 # ─────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────
+# P7: Tool Registry for ReAct pattern
+# ─────────────────────────────────────────────────
+
+class ToolDefinition(BaseModel):
+    """Description of a tool available to the ReAct agent."""
+    name: str = Field(description="Tool name, used by the LLM to invoke it")
+    description: str = Field(description="What this tool does and when to use it")
+    parameters: dict[str, str] = Field(
+        default_factory=dict,
+        description="Parameter name -> description mapping",
+    )
+    returns: str = Field(default="str", description="Description of the return value")
+
+
+class ToolRegistry:
+    """
+    P7: Registry of callable tools for the ReAct troubleshooting pattern.
+
+    Maps tool names to async callables. The ReAct prompt lists available tools;
+    the execution loop parses LLM "Action: tool_name(args)" outputs and dispatches
+    to the registered implementation.
+
+    Default stub implementations are provided for the four core tools:
+    - query_kusto: Execute a KQL query against Azure Data Explorer
+    - search_confluence: Search Confluence for runbooks and procedures
+    - check_icm: Look up an ICM incident or create a new one
+    - query_log_analytics: Execute a Log Analytics KQL query (AzureDiagnostics etc.)
+
+    Replace stub implementations with real MCP/API calls in production.
+    """
+
+    def __init__(self) -> None:
+        self._tools: dict[str, ToolDefinition] = {}
+        self._callables: dict[str, Callable[..., Any]] = {}
+        self._register_defaults()
+
+    def register(self, definition: ToolDefinition, fn: Callable[..., Any]) -> None:
+        """Register a tool with its definition and implementation callable."""
+        self._tools[definition.name] = definition
+        self._callables[definition.name] = fn
+
+    def get_tools_description(self) -> str:
+        """Format all registered tools as a string for prompt injection."""
+        lines = []
+        for tool in self._tools.values():
+            params = ", ".join(f"{k}: {v}" for k, v in tool.parameters.items()) or "none"
+            lines.append(
+                f"- {tool.name}({params}) -> {tool.returns}\n"
+                f"  {tool.description}"
+            )
+        return "\n".join(lines)
+
+    async def execute(self, tool_name: str, **kwargs: Any) -> str:
+        """Execute a registered tool by name. Returns observation string for ReAct loop."""
+        if tool_name not in self._callables:
+            available = ", ".join(self._tools.keys())
+            return f"[ToolError] Unknown tool '{tool_name}'. Available: {available}"
+        try:
+            fn = self._callables[tool_name]
+            if asyncio.iscoroutinefunction(fn):
+                result = await fn(**kwargs)
+            else:
+                result = fn(**kwargs)
+            return str(result)
+        except Exception as exc:
+            return f"[ToolError] {tool_name} raised {type(exc).__name__}: {exc}"
+
+    def _register_defaults(self) -> None:
+        """Register stub implementations for the four core tools."""
+
+        async def _query_kusto(query: str, database: str = "") -> str:
+            """Stub: Execute a KQL query against Azure Data Explorer."""
+            logger.info("tool_query_kusto_stub", query=query[:200], database=database)
+            return (
+                "[STUB] query_kusto not connected to a real ADX cluster. "
+                f"Would execute: {query[:500]}"
+            )
+
+        self.register(
+            ToolDefinition(
+                name="query_kusto",
+                description=(
+                    "Execute a KQL query against the Azure Data Explorer (Kusto) cluster. "
+                    "Use to check ingestion status, query telemetry tables, or diagnose ADX issues."
+                ),
+                parameters={"query": "KQL query string", "database": "(optional) ADX database name"},
+                returns="Query results as a formatted string, or an error message",
+            ),
+            _query_kusto,
+        )
+
+        async def _search_confluence(query: str, space_key: str = "") -> str:
+            """Stub: Search Confluence for runbooks, procedures, and documentation."""
+            logger.info("tool_search_confluence_stub", query=query[:200], space_key=space_key)
+            return (
+                "[STUB] search_confluence not connected to a real Confluence instance. "
+                f"Would search for: {query[:300]}"
+            )
+
+        self.register(
+            ToolDefinition(
+                name="search_confluence",
+                description=(
+                    "Search Confluence for runbooks, procedures, and documentation. "
+                    "Use to find step-by-step resolution guides for known error patterns."
+                ),
+                parameters={
+                    "query": "Search query string",
+                    "space_key": "(optional) Confluence space key, e.g. RUNBOOKS or OPS",
+                },
+                returns="Matching page excerpts with titles and links",
+            ),
+            _search_confluence,
+        )
+
+        async def _check_icm(incident_id: str = "", pipeline_name: str = "") -> str:
+            """Stub: Look up an ICM incident or find recent incidents for a pipeline."""
+            logger.info("tool_check_icm_stub", incident_id=incident_id, pipeline_name=pipeline_name)
+            return (
+                "[STUB] check_icm not connected to a real ICM instance. "
+                f"Would look up incident_id={incident_id!r}, pipeline={pipeline_name!r}"
+            )
+
+        self.register(
+            ToolDefinition(
+                name="check_icm",
+                description=(
+                    "Look up an ICM incident by ID, or find recent incidents for a pipeline. "
+                    "Use to check for open ICM tickets, get resolution history, or find on-call contacts."
+                ),
+                parameters={
+                    "incident_id": "(optional) ICM incident ID to look up directly",
+                    "pipeline_name": "(optional) Pipeline name to search recent incidents for",
+                },
+                returns="Incident details including severity, status, owner, and resolution notes",
+            ),
+            _check_icm,
+        )
+
+        async def _query_log_analytics(query: str, timespan: str = "P1D") -> str:
+            """Stub: Execute a KQL query against Azure Log Analytics workspace."""
+            logger.info("tool_query_log_analytics_stub", query=query[:200], timespan=timespan)
+            return (
+                "[STUB] query_log_analytics not connected to a real Log Analytics workspace. "
+                f"Would execute (timespan={timespan}): {query[:500]}"
+            )
+
+        self.register(
+            ToolDefinition(
+                name="query_log_analytics",
+                description=(
+                    "Execute a KQL query against Azure Log Analytics. "
+                    "Use to search AzureDiagnostics, SparkListenerEvent, SynapseActivity, "
+                    "or AppExceptions tables for detailed error logs and metrics."
+                ),
+                parameters={
+                    "query": "KQL query string targeting Log Analytics tables",
+                    "timespan": "(optional) ISO 8601 duration, default P1D (last 24 hours)",
+                },
+                returns="Query results rows as a formatted string",
+            ),
+            _query_log_analytics,
+        )
+
+
+# Global default tool registry — shared across PromptEngine instances unless overridden
+DEFAULT_TOOL_REGISTRY = ToolRegistry()
+
+
 class DSPyPromptOptimizer:
     """
     DSPy-style programmatic prompt optimization.
@@ -110,37 +282,42 @@ class DSPyPromptOptimizer:
     prompt construction with metric-driven selection.
     """
 
-    def __init__(self):
+    def __init__(self, default_temperature: float = 0.1):
+        # P8: Single configurable temperature default — eliminates 0.1/0.2/0.3 inconsistencies.
+        # All DSPy signatures use this value unless explicitly overridden at call time.
+        # Source of truth: LLMSettings.temperature in config/settings.py (default 0.1).
+        self._default_temperature = default_temperature
         # Signature registry: maps (error_class, pipeline_type) -> best technique
         self._signature_cache: dict[str, dict[str, Any]] = {}
         # Performance metrics per technique per error class
         self._metrics: dict[str, list[float]] = {}
-        # Default signatures
+        # Default signatures — all use self._default_temperature (P8 normalization)
+        t = self._default_temperature
         self._default_signatures = {
             "OutOfMemoryError": {
                 "technique": "few_shot",
-                "temperature": 0.1,
+                "temperature": t,
                 "reason": "OOM errors have strong patterns that few-shot examples capture well",
             },
             "TimeoutException": {
                 "technique": "cot",
-                "temperature": 0.2,
+                "temperature": t,
                 "reason": "Timeouts need step-by-step reasoning to identify the bottleneck",
             },
             "ConnectionFailure": {
                 "technique": "react",
-                "temperature": 0.1,
+                "temperature": t,
                 "reason": "Connection issues need iterative checking of multiple components",
             },
             "ConfigurationError": {
                 "technique": "step_back",
-                "temperature": 0.1,
+                "temperature": t,
                 "reason": "Config errors benefit from abstract reasoning before specific diagnosis",
             },
             "SchemaError": {
                 "technique": "cot",
-                "temperature": 0.1,
-                "reason": "Schema mismatches need careful field-by-field comparison",
+                "temperature": t,
+                "reason": "Schema mismatches need careful field-by-step comparison",
             },
         }
 
@@ -172,27 +349,28 @@ class DSPyPromptOptimizer:
         if error_class in self._default_signatures and not is_ambiguous:
             signature = {**self._default_signatures[error_class]}
         elif is_ambiguous:
+            # P8: use normalized default temperature
             signature = {
                 "technique": "tree_of_thought",
-                "temperature": 0.3,
+                "temperature": self._default_temperature,
                 "reason": "Ambiguous errors need hypothesis exploration via Tree-of-Thought",
             }
         elif rag_context_length > 1000:
             signature = {
                 "technique": "cot",
-                "temperature": 0.1,
+                "temperature": self._default_temperature,
                 "reason": "Rich context available — Chain-of-Thought to reason through evidence",
             }
         elif rag_context_length > 0:
             signature = {
                 "technique": "few_shot",
-                "temperature": 0.1,
+                "temperature": self._default_temperature,
                 "reason": "Some context — use few-shot examples to guide analysis format",
             }
         else:
             signature = {
                 "technique": "zero_shot",
-                "temperature": 0.2,
+                "temperature": self._default_temperature,
                 "reason": "No context — rely on LLM parametric knowledge with zero-shot",
             }
 
@@ -227,7 +405,7 @@ class DSPyPromptOptimizer:
             if not current or avg > 0.8:
                 self._default_signatures[error_class] = {
                     "technique": technique,
-                    "temperature": 0.1,
+                    "temperature": self._default_temperature,  # P8: use normalized temperature
                     "reason": f"Auto-optimized: avg score {avg:.2f} over {len(self._metrics[key])} samples",
                 }
                 logger.info(
@@ -276,11 +454,21 @@ class PromptEngine:
         llm_client: Any = None,
         max_context_tokens: int = 120000,
         default_temperature: float = 0.1,
+        llm_timeout: float = 30.0,
+        tool_registry: Optional["ToolRegistry"] = None,
+        conversation_token_budget: int = 8000,
     ):
         self.llm_client = llm_client
         self.max_context_tokens = max_context_tokens
         self.default_temperature = default_temperature
-        self.dspy_optimizer = DSPyPromptOptimizer()
+        # P12: configurable timeout for all LLM calls (default 30 s)
+        self.llm_timeout = llm_timeout
+        # P7: ToolRegistry for ReAct pattern
+        self.tool_registry = tool_registry or DEFAULT_TOOL_REGISTRY
+        # P11: token budget for conversation history (approximate chars; 1 token ≈ 4 chars)
+        self.conversation_token_budget = conversation_token_budget
+        # P8: DSPy optimizer shares the same temperature default as PromptEngine
+        self.dspy_optimizer = DSPyPromptOptimizer(default_temperature=default_temperature)
 
     def build_system_prompt(
         self,
@@ -300,6 +488,34 @@ class PromptEngine:
             parts.append(f"\n=== ADDITIONAL INSTRUCTIONS ===\n{custom_instructions}")
 
         return "\n\n".join(parts)
+
+
+    def build_cold_start_prompt(
+        self,
+        user_question: str,
+        context: ConversationContext,
+    ) -> list[dict[str, str]]:
+        """P2: Build a cold-start prompt when no alert context exists.
+
+        Routes the LLM to ask clarifying questions or suggest discovery queries
+        rather than falling through to generic Q&A.
+        """
+        messages = [{"role": "system", "content": self.build_system_prompt()}]
+
+        # Build minimal history (last 5 messages only — cold-start is brief)
+        history_msgs = context.get_recent_messages(5)
+        history_parts = []
+        for msg in history_msgs:
+            role_label = "Support Engineer" if msg.role == MessageRole.USER else "Alert Whisperer"
+            history_parts.append(f"{role_label}: {msg.content}")
+        conversation_history = "\n".join(history_parts) if history_parts else "No prior conversation."
+
+        user_content = COLD_START_PROMPT.render(
+            user_question=user_question,
+            conversation_history=conversation_history,
+        )
+        messages.append({"role": "user", "content": user_content})
+        return messages
 
     def build_root_cause_prompt(
         self,
@@ -460,15 +676,17 @@ class PromptEngine:
         context: ConversationContext,
         rag_context: str = "",
     ) -> list[dict[str, str]]:
-        """Build a conversational Q&A prompt with full context."""
+        """Build a conversational Q&A prompt with full context.
+
+        P11: Applies conversation_token_budget to prevent context window overflow.
+        Long conversations are truncated with oldest messages dropped first.
+        If even a single-message history exceeds the budget, it is summarized.
+        """
         messages = [{"role": "system", "content": self.build_system_prompt()}]
 
-        # Build conversation history string
-        history_parts = []
-        for msg in context.get_recent_messages(10):
-            role_label = "Support Engineer" if msg.role == MessageRole.USER else "Alert Whisperer"
-            history_parts.append(f"{role_label}: {msg.content}")
-        conversation_history = "\n".join(history_parts) if history_parts else "No prior conversation."
+        # P11: Build conversation history with token budget enforcement
+        raw_history = context.get_recent_messages(50)  # fetch more; we'll trim
+        conversation_history = self._truncate_conversation_history(raw_history)
 
         # Build alert context string
         alert_context = "No active alert."
@@ -589,26 +807,47 @@ class PromptEngine:
         temperature: Optional[float] = None,
         max_tokens: int = 4096,
         response_format: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> str:
-        """Invoke the LLM with the constructed messages."""
+        """Invoke the LLM with the constructed messages.
+
+        P12: All calls are wrapped in asyncio.wait_for with a configurable timeout
+        (default self.llm_timeout = 30 s). Pass timeout=None to disable.
+        """
         if not self.llm_client:
             logger.warning("llm_client_not_configured")
             return "[LLM not configured — returning mock response for development]"
 
-        try:
+        effective_timeout = timeout if timeout is not None else self.llm_timeout
+
+        async def _call() -> str:
             kwargs: dict[str, Any] = {
                 "model": self.llm_client.model if hasattr(self.llm_client, "model") else "gpt-4o",
                 "messages": messages,
                 "temperature": temperature or self.default_temperature,
                 "max_tokens": max_tokens,
             }
-
             if response_format == "json":
                 kwargs["response_format"] = {"type": "json_object"}
-
             response = await self.llm_client.chat.completions.create(**kwargs)
             return response.choices[0].message.content or ""
 
+        try:
+            if effective_timeout and effective_timeout > 0:
+                result = await asyncio.wait_for(_call(), timeout=effective_timeout)
+            else:
+                result = await _call()
+            return result
+        except asyncio.TimeoutError:
+            logger.error(
+                "llm_invocation_timeout",
+                timeout_seconds=effective_timeout,
+                message_count=len(messages),
+            )
+            raise asyncio.TimeoutError(
+                f"LLM call timed out after {effective_timeout}s. "
+                "Consider increasing llm_timeout or reducing context size."
+            )
         except Exception as e:
             logger.error("llm_invocation_error", error=str(e))
             raise
@@ -710,6 +949,48 @@ class PromptEngine:
         )
 
     # ─── Internal Helpers ─────────────────────────
+
+    def _truncate_conversation_history(
+        self,
+        messages: list[ChatMessage],
+    ) -> str:
+        """P11: Truncate conversation history to stay within conversation_token_budget.
+
+        Strategy:
+        1. Convert messages to strings (role: content format).
+        2. Drop oldest messages until the total char count is within budget.
+        3. If even the newest message exceeds the budget, truncate it.
+        4. Prepend a notice when messages are dropped.
+
+        Budget is measured in characters (approximate: 1 token ≈ 4 chars).
+        """
+        char_budget = self.conversation_token_budget * 4  # convert token budget to chars
+
+        parts = []
+        for msg in messages:
+            role_label = "Support Engineer" if msg.role == MessageRole.USER else "Alert Whisperer"
+            parts.append(f"{role_label}: {msg.content}")
+
+        if not parts:
+            return "No prior conversation."
+
+        # Drop oldest messages until within budget
+        dropped = 0
+        while parts and sum(len(p) for p in parts) > char_budget:
+            parts.pop(0)
+            dropped += 1
+
+        history = "\n".join(parts)
+
+        if dropped:
+            notice = f"[{dropped} older message(s) omitted to stay within context budget]\n"
+            history = notice + history
+
+        # Hard truncate if a single message is still too long
+        if len(history) > char_budget:
+            history = history[:char_budget] + "\n[...truncated for context budget...]"
+
+        return history if history.strip() else "No prior conversation."
 
     def _select_technique(self, failure: ParsedFailure, rag_context: str) -> str:
         """

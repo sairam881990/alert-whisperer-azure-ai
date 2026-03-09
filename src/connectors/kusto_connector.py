@@ -9,7 +9,7 @@ Supports both direct KQL execution and pre-built diagnostic queries.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 import structlog
 
@@ -96,6 +96,42 @@ KQL_QUERIES = {
         | project FailedOn, Table, Details, ErrorCode
         | order by FailedOn desc
         | take {limit}
+    """,
+
+    # M8: Additional production diagnostic queries
+    "cluster_version": """
+        .show version
+    """,
+
+    "ingestion_status": """
+        .show ingestion failures
+        | where FailedOn > ago({timespan})
+        | summarize FailureCount=count(), LastFailure=max(FailedOn)
+          by Table, ErrorCode
+        | order by FailureCount desc
+    """,
+
+    "cache_utilization": """
+        .show cache utilization
+    """,
+
+    "query_stats": """
+        .show queries
+        | where StartedOn > ago({timespan})
+        | summarize QueryCount=count(), AvgDurationMs=avg(totalseconds(Duration) * 1000)
+          by Database
+        | order by QueryCount desc
+    """,
+
+    "table_details": """
+        .show table {table_name} details
+    """,
+
+    "extent_stats": """
+        .show database extents
+        | summarize ExtentCount=count(), TotalOriginalSizeGB=sum(OriginalSize) / 1073741824.0
+          by TableName
+        | order by TotalOriginalSizeGB desc
     """,
 }
 
@@ -250,6 +286,250 @@ class KustoMCPClient(BaseMCPClient):
             table_name=table_name, timespan=timespan
         )
         return await self.execute_query(query)
+
+    # ─── M2: Streaming / Batch-Fetch for Large Results ────
+
+    async def stream_query_results(
+        self,
+        query: str,
+        database: Optional[str] = None,
+        batch_size: int = 1000,
+        max_batches: int = 20,
+        timeout_seconds: int = 120,
+    ) -> AsyncIterator[list[Any]]:
+        """
+        M2: Stream KQL query results in batches instead of loading everything
+        into memory at once. Useful for large result sets (e.g., bulk ingestion
+        failure dumps, full table scans).
+
+        Implements a batch-fetch pattern using `skip` / `take` pagination
+        on top of the Kusto MCP execute_query tool.
+
+        Args:
+            query: Base KQL query (must NOT already contain a `take` / `skip`)
+            database: Target database
+            batch_size: Number of rows per batch
+            max_batches: Maximum batches to fetch (safety cap)
+            timeout_seconds: Per-batch query timeout
+
+        Yields:
+            Lists of rows (raw query result items) one batch at a time.
+        """
+        db = database or self.database
+        logger.info(
+            "kusto_stream_start",
+            database=db,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            query_preview=query[:100],
+        )
+
+        # Wrap the caller's query in a sub-query so we can paginate safely
+        base_query = query.strip().rstrip("|")
+
+        for batch_num in range(max_batches):
+            offset = batch_num * batch_size
+            paginated_query = (
+                f"let _base = ({base_query});\n"
+                f"_base\n"
+                f"| skip {offset}\n"
+                f"| take {batch_size}"
+            )
+
+            try:
+                result = await self.call_tool(
+                    tool_name="execute_query",
+                    arguments={
+                        "query": paginated_query,
+                        "database": db,
+                        "timeout": timeout_seconds,
+                    },
+                )
+            except Exception as e:
+                logger.error(
+                    "kusto_stream_batch_error",
+                    batch_num=batch_num,
+                    offset=offset,
+                    error=str(e),
+                )
+                return
+
+            # Normalise to a list
+            if isinstance(result, list):
+                batch = result
+            elif isinstance(result, str):
+                batch = self._parse_text_table(result)
+            elif isinstance(result, dict) and "rows" in result:
+                batch = result["rows"]
+            else:
+                batch = [result] if result else []
+
+            if not batch:
+                logger.info("kusto_stream_exhausted", batches_fetched=batch_num)
+                return
+
+            logger.debug(
+                "kusto_stream_batch",
+                batch_num=batch_num,
+                rows_in_batch=len(batch),
+            )
+            yield batch
+
+            # If the batch is smaller than batch_size, we've reached the end
+            if len(batch) < batch_size:
+                logger.info(
+                    "kusto_stream_complete",
+                    total_batches=batch_num + 1,
+                    last_batch_rows=len(batch),
+                )
+                return
+
+        logger.warning(
+            "kusto_stream_max_batches_reached",
+            max_batches=max_batches,
+            total_rows_approx=max_batches * batch_size,
+        )
+
+    # ─── M4: Per-Connector Health Check ───────────────────
+
+    async def health_check(self) -> dict[str, Any]:
+        """
+        M4: Kusto-specific health check.
+        Hits /health on the MCP server AND runs `.show version` to validate
+        the underlying cluster is reachable.
+        """
+        status = await super().health_check()
+        status["connector"] = "kusto"
+        status["database"] = self.database
+        status["cluster_url"] = self.cluster_url
+
+        if status["healthy"]:
+            try:
+                version_result = await self.execute_query(
+                    KQL_QUERIES["cluster_version"], timeout_seconds=10
+                )
+                status["cluster_reachable"] = True
+                status["cluster_version"] = (
+                    str(version_result)[:200] if version_result else "unknown"
+                )
+            except Exception as exc:
+                status["cluster_reachable"] = False
+                status["cluster_version_error"] = str(exc)
+
+        return status
+
+    # ─── M8: Additional diagnostic query helpers ───────────
+
+    async def get_cache_utilization(self) -> Any:
+        """M8: Retrieve cache utilization statistics from the cluster."""
+        return await self.execute_query(KQL_QUERIES["cache_utilization"])
+
+    async def get_query_stats(self, timespan: str = "1h") -> Any:
+        """M8: Return per-database query counts and average duration."""
+        query = KQL_QUERIES["query_stats"].format(timespan=timespan)
+        return await self.execute_query(query)
+
+    async def get_table_details(self, table_name: str) -> Any:
+        """M8: Return metadata details for a specific Kusto table."""
+        query = KQL_QUERIES["table_details"].format(table_name=table_name)
+        return await self.execute_query(query)
+
+    async def get_extent_stats(self) -> Any:
+        """M8: Return extent counts and total original sizes per table."""
+        return await self.execute_query(KQL_QUERIES["extent_stats"])
+
+    async def get_ingestion_status(self, timespan: str = "24h") -> Any:
+        """M8: Summarise recent ingestion failures by table and error code."""
+        query = KQL_QUERIES["ingestion_status"].format(timespan=timespan)
+        return await self.execute_query(query)
+
+    # ─── M9: GraphRAG Dependency Metadata ─────────────────
+
+    async def get_table_dependencies(
+        self,
+        database: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        M9: Return table lineage metadata for GraphRAG dependency mapping.
+
+        Queries materialized views, update policies, and function references
+        to build a dependency graph for ADF/Databricks/Synapse pipelines.
+
+        Returns:
+            Dict with keys:
+            - materialized_views: list of {name, source_table, query}
+            - update_policies: list of {table, policy_query, source_table}
+            - databases: list of database names in the cluster
+        """
+        db = database or self.database
+        logger.info("kusto_get_table_dependencies", database=db)
+
+        dependencies: dict[str, Any] = {
+            "database": db,
+            "materialized_views": [],
+            "update_policies": [],
+            "databases": [],
+        }
+
+        # Fetch materialized views
+        try:
+            mv_result = await self.execute_query(
+                ".show materialized-views",
+                database=db,
+                timeout_seconds=30,
+            )
+            if isinstance(mv_result, list):
+                dependencies["materialized_views"] = [
+                    {
+                        "name": row.get("Name", row.get("MaterializedViewName", "")),
+                        "source_table": row.get("SourceTable", ""),
+                        "query": row.get("Query", "")[:500],
+                        "is_healthy": row.get("IsHealthy", True),
+                    }
+                    for row in mv_result
+                    if isinstance(row, dict)
+                ]
+            elif isinstance(mv_result, str):
+                rows = self._parse_text_table(mv_result)
+                dependencies["materialized_views"] = rows
+        except Exception as exc:
+            logger.warning("kusto_mv_fetch_failed", error=str(exc))
+            dependencies["materialized_views_error"] = str(exc)
+
+        # Fetch tables with update policies
+        try:
+            policy_result = await self.execute_query(
+                ".show tables details | project TableName, UpdatePolicy",
+                database=db,
+                timeout_seconds=30,
+            )
+            if isinstance(policy_result, list):
+                for row in policy_result:
+                    if isinstance(row, dict) and row.get("UpdatePolicy"):
+                        dependencies["update_policies"].append({
+                            "table": row.get("TableName", ""),
+                            "policy_raw": str(row.get("UpdatePolicy", ""))[:500],
+                        })
+        except Exception as exc:
+            logger.warning("kusto_policy_fetch_failed", error=str(exc))
+            dependencies["update_policies_error"] = str(exc)
+
+        # List databases in the cluster for cross-db lineage
+        try:
+            db_result = await self.execute_query(
+                ".show databases | project DatabaseName",
+                database=db,
+                timeout_seconds=15,
+            )
+            if isinstance(db_result, list):
+                dependencies["databases"] = [
+                    row.get("DatabaseName", "") for row in db_result
+                    if isinstance(row, dict)
+                ]
+        except Exception as exc:
+            logger.warning("kusto_db_list_failed", error=str(exc))
+
+        return dependencies
 
     # ─── Internal Parsers ─────────────────────────
 

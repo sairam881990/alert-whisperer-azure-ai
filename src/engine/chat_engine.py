@@ -1167,7 +1167,24 @@ class ChatEngine:
         """
         Handle general Q&A with enhanced RAG context.
         Uses Agentic RAG for multi-source retrieval.
+
+        P2: Cold-start routing — when no active alert is bound and no triage engine
+        is available, use the specialized cold_start prompt instead of generic Q&A.
+        This guides the LLM to ask clarifying questions or suggest discovery queries.
         """
+        # P2: Route to cold-start prompt if there is no alert context and no triage engine
+        is_cold_start = (
+            session.active_alert is None
+            and not self.triage_engine
+        )
+        if is_cold_start:
+            messages = self.prompt_engine.build_cold_start_prompt(
+                user_question=message,
+                context=session,
+            )
+            logger.info("cold_start_routing_applied", session_id=session.session_id)
+            return await self.prompt_engine.invoke_llm(messages)
+
         # Retrieve context using Agentic RAG (multi-source)
         result = await self.rag_retriever.retrieve_for_query(
             message, active_alert=session.active_alert

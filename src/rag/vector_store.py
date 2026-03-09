@@ -97,6 +97,191 @@ def _tokens_to_chars(n_tokens: int) -> int:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# R17: Retrieval Telemetry Collector
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class RetrievalTelemetry:
+    """
+    R17: Lightweight in-process telemetry collector for RAG retrieval quality.
+
+    Tracks per-technique metrics:
+    - Hit rates (fraction of queries that returned ≥1 relevant result)
+    - Latency distribution (ms)
+    - Average relevance scores
+    - Per-source breakdown
+
+    Usage:
+        telemetry = RetrievalTelemetry()
+        with telemetry.measure("rag_fusion"):
+            result = await rag_fusion.retrieve_and_fuse(query)
+        telemetry.record("rag_fusion", result)
+
+        stats = telemetry.get_stats()  # summary dict
+        telemetry.reset()              # clear all counters
+    """
+
+    def __init__(self, max_recent_latencies: int = 100):
+        """Args:
+            max_recent_latencies: Rolling window size for latency percentile computation.
+        """
+        self._max_recent = max_recent_latencies
+        self._data: dict[str, dict[str, Any]] = {}  # technique -> metrics
+
+    def _ensure_technique(self, technique: str) -> None:
+        if technique not in self._data:
+            self._data[technique] = {
+                "queries": 0,
+                "hits": 0,        # queries with ≥1 result above threshold
+                "total_results": 0,
+                "total_relevance": 0.0,
+                "latencies_ms": [],  # rolling window
+                "by_source": defaultdict(lambda: {"queries": 0, "hits": 0, "total_relevance": 0.0}),
+            }
+
+    def record(
+        self,
+        technique: str,
+        query: str,
+        chunks: list,
+        latency_ms: float,
+        relevance_threshold: float = 0.3,
+    ) -> None:
+        """
+        Record a single retrieval event.
+
+        Args:
+            technique: Technique label (e.g. 'rag_fusion', 'hyde', 'bm25')
+            query: The search query (used for logging only, not stored)
+            chunks: Retrieved DocumentChunk objects (must have metadata.similarity_score)
+            latency_ms: Retrieval latency in milliseconds
+            relevance_threshold: Minimum score to count a chunk as a "hit"
+        """
+        self._ensure_technique(technique)
+        d = self._data[technique]
+
+        d["queries"] += 1
+        d["total_results"] += len(chunks)
+
+        # Latency rolling window
+        d["latencies_ms"].append(latency_ms)
+        if len(d["latencies_ms"]) > self._max_recent:
+            d["latencies_ms"] = d["latencies_ms"][-self._max_recent:]
+
+        # Hit rate and relevance
+        relevant_chunks = [
+            c for c in chunks
+            if float(getattr(c, 'metadata', {}).get("similarity_score", 0.0) or 0.0) >= relevance_threshold
+        ]
+        if relevant_chunks:
+            d["hits"] += 1
+
+        total_score = sum(
+            float(getattr(c, 'metadata', {}).get("similarity_score", 0.0) or 0.0)
+            for c in chunks
+        )
+        d["total_relevance"] += total_score
+
+        # Per-source breakdown
+        for chunk in chunks:
+            src = getattr(chunk, 'source_type', 'unknown')
+            score = float(getattr(chunk, 'metadata', {}).get("similarity_score", 0.0) or 0.0)
+            src_data = d["by_source"][src]
+            src_data["queries"] += 1
+            src_data["total_relevance"] += score
+            if score >= relevance_threshold:
+                src_data["hits"] += 1
+
+        logger.debug(
+            "retrieval_telemetry_recorded",
+            technique=technique,
+            latency_ms=round(latency_ms, 2),
+            results=len(chunks),
+            relevant=len(relevant_chunks),
+        )
+
+    def get_stats(self, technique: Optional[str] = None) -> dict[str, Any]:
+        """
+        Return summary statistics.
+
+        Args:
+            technique: If specified, return stats for that technique only.
+                       If None, return aggregate stats for all techniques.
+
+        Returns:
+            Dict with hit_rate, avg_latency_ms, p95_latency_ms, avg_relevance_score,
+            queries, hits, avg_results_per_query, by_source breakdown.
+        """
+        techniques = [technique] if technique else list(self._data.keys())
+        result = {}
+
+        for tech in techniques:
+            if tech not in self._data:
+                result[tech] = {"error": "no_data"}
+                continue
+
+            d = self._data[tech]
+            queries = d["queries"]
+            latencies = d["latencies_ms"]
+
+            if not latencies:
+                avg_lat = 0.0
+                p95_lat = 0.0
+            else:
+                avg_lat = sum(latencies) / len(latencies)
+                sorted_lats = sorted(latencies)
+                p95_idx = min(int(len(sorted_lats) * 0.95), len(sorted_lats) - 1)
+                p95_lat = sorted_lats[p95_idx]
+
+            avg_relevance = (
+                d["total_relevance"] / d["total_results"]
+                if d["total_results"] > 0 else 0.0
+            )
+
+            # Per-source summary
+            by_source_summary = {}
+            for src, src_d in d["by_source"].items():
+                sq = src_d["queries"]
+                by_source_summary[src] = {
+                    "hit_rate": round(src_d["hits"] / sq, 4) if sq > 0 else 0.0,
+                    "avg_relevance": round(src_d["total_relevance"] / sq, 4) if sq > 0 else 0.0,
+                    "queries": sq,
+                }
+
+            result[tech] = {
+                "queries": queries,
+                "hits": d["hits"],
+                "hit_rate": round(d["hits"] / queries, 4) if queries > 0 else 0.0,
+                "avg_latency_ms": round(avg_lat, 2),
+                "p95_latency_ms": round(p95_lat, 2),
+                "avg_relevance_score": round(avg_relevance, 4),
+                "avg_results_per_query": round(d["total_results"] / queries, 2) if queries > 0 else 0.0,
+                "by_source": by_source_summary,
+            }
+
+        if technique:
+            return result.get(technique, {})
+        return result
+
+    def reset(self, technique: Optional[str] = None) -> None:
+        """Reset counters. If technique is None, reset all."""
+        if technique:
+            self._data.pop(technique, None)
+        else:
+            self._data.clear()
+        logger.info("retrieval_telemetry_reset", technique=technique or "all")
+
+    def summary_log(self) -> None:
+        """Emit a structured log summary of all collected metrics."""
+        stats = self.get_stats()
+        for tech, metrics in stats.items():
+            logger.info(
+                "retrieval_telemetry_summary",
+                technique=tech,
+                **{k: v for k, v in metrics.items() if k != "by_source"},
+            )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # BM25 Index for Lexical Search (fallback / augmentation)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -115,10 +300,28 @@ class BM25Index:
     - Augmentation layer on top of Azure AI Search when extra keyword coverage is needed
     """
 
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
+    # R12: Default field weights — pipeline_name and error_class are boosted
+    DEFAULT_FIELD_WEIGHTS: dict[str, float] = {
+        "pipeline_name": 2.0,
+        "error_class": 2.0,
+        "content": 1.0,
+    }
+
+    def __init__(
+        self,
+        k1: float = 1.5,
+        b: float = 0.75,
+        field_weights: Optional[dict[str, float]] = None,
+    ):
         self.k1 = k1
         self.b = b
+        # R12: field_weights allows boosting specific metadata fields in BM25 scoring
+        self.field_weights: dict[str, float] = (
+            field_weights if field_weights is not None
+            else dict(self.DEFAULT_FIELD_WEIGHTS)
+        )
         self._documents: dict[str, str] = {}  # doc_id -> content
+        self._doc_metadata: dict[str, dict[str, str]] = {}  # doc_id -> field values
         self._doc_lengths: dict[str, int] = {}
         self._avg_dl: float = 0.0
         self._df: Counter = Counter()  # document frequency per term
@@ -130,12 +333,32 @@ class BM25Index:
         """Simple whitespace + punctuation tokenizer."""
         return re.findall(r'\b\w+\b', text.lower())
 
-    def add_document(self, doc_id: str, content: str) -> None:
-        """Index a single document."""
+    def add_document(
+        self,
+        doc_id: str,
+        content: str,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Index a single document, optionally with boosted metadata fields."""
         tokens = self._tokenize(content)
         self._documents[doc_id] = content
+        self._doc_metadata[doc_id] = metadata or {}
         self._doc_lengths[doc_id] = len(tokens)
         self._tf[doc_id] = Counter(tokens)
+
+        # R12: Inject boosted field tokens into the term-frequency index
+        if metadata:
+            for field, weight in self.field_weights.items():
+                if field == "content" or field not in metadata:
+                    continue
+                field_value = metadata[field]
+                if not field_value:
+                    continue
+                field_tokens = self._tokenize(field_value)
+                # Multiply TF by weight factor to boost field matches
+                extra_count = max(1, int(weight) - 1)  # e.g. weight=2.0 → add 1 extra occurrence
+                for ft in field_tokens:
+                    self._tf[doc_id][ft] += extra_count
 
         # Update document frequency
         unique_terms = set(tokens)
@@ -145,10 +368,15 @@ class BM25Index:
         self._n_docs = len(self._documents)
         self._avg_dl = sum(self._doc_lengths.values()) / max(self._n_docs, 1)
 
-    def add_documents_batch(self, docs: dict[str, str]) -> None:
-        """Batch index multiple documents."""
+    def add_documents_batch(
+        self,
+        docs: dict[str, str],
+        metadata_map: Optional[dict[str, dict[str, str]]] = None,
+    ) -> None:
+        """Batch index multiple documents, optionally with per-document metadata."""
         for doc_id, content in docs.items():
-            self.add_document(doc_id, content)
+            meta = metadata_map.get(doc_id) if metadata_map else None
+            self.add_document(doc_id, content, metadata=meta)
 
     def search(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
         """
@@ -300,11 +528,14 @@ class ParentChildChunkManager:
         parent_chunk_tokens: int = 1200,
         child_chunk_tokens: int = 450,
         child_overlap_tokens: int = 50,
+        parent_overlap_tokens: int = 100,
     ):
         # Token-based sizes (primary)
         self.parent_chunk_tokens = parent_chunk_tokens
         self.child_chunk_tokens = child_chunk_tokens
         self.child_overlap_tokens = child_overlap_tokens
+        # R10: Configurable parent chunk overlap to avoid losing context at parent boundaries
+        self.parent_overlap_tokens = parent_overlap_tokens
 
         # Derived character estimates for fallback
         self.parent_chunk_size = _tokens_to_chars(parent_chunk_tokens)  # ~4800 chars
@@ -335,9 +566,9 @@ class ParentChildChunkManager:
         parents = []
         all_children = []
 
-        # Step 1: Create parent chunks (token-based)
+        # Step 1: Create parent chunks (token-based) with configurable overlap (R10)
         parent_texts = self._split_text_by_tokens(
-            content, self.parent_chunk_tokens, overlap_tokens=100
+            content, self.parent_chunk_tokens, overlap_tokens=self.parent_overlap_tokens
         )
 
         for p_idx, parent_text in enumerate(parent_texts):
@@ -726,7 +957,19 @@ class SemanticChunker:
             else:
                 merged.append(buffer)
 
-        return [c for c in merged if c.strip()]
+        # R11: Final pass — enforce min_chunk_tokens by merging any remaining tiny chunks
+        # (e.g. a trailing fragment after force-splitting an oversized candidate)
+        enforced: list[str] = []
+        for chunk_text in merged:
+            if not chunk_text.strip():
+                continue
+            if _count_tokens(chunk_text) < self.min_chunk_tokens and enforced:
+                # Merge into the previous chunk rather than emit a tiny fragment
+                enforced[-1] = f"{enforced[-1]} {chunk_text}"
+            else:
+                enforced.append(chunk_text)
+
+        return [c for c in enforced if c.strip()]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -940,6 +1183,7 @@ class VectorStore:
         self,
         chunks: list[DocumentChunk],
         batch_size: int = 50,
+        progress_callback: Optional[Any] = None,
     ) -> int:
         """
         Add document chunks to the vector store.
@@ -951,6 +1195,9 @@ class VectorStore:
         Args:
             chunks: List of DocumentChunk objects
             batch_size: Number of chunks to process per batch
+            progress_callback: R13 — Optional callable invoked after each batch.
+                Signature: callback(processed: int, total: int, batch_added: int) -> None.
+                Use for progress bars or logging in long-running indexing jobs.
 
         Returns:
             Number of new documents added
@@ -959,8 +1206,9 @@ class VectorStore:
             return 0
 
         added = 0
+        total = len(chunks)
 
-        for i in range(0, len(chunks), batch_size):
+        for i in range(0, total, batch_size):
             batch = chunks[i : i + batch_size]
 
             # Generate embeddings for the batch
@@ -1009,12 +1257,29 @@ class VectorStore:
                     }
                     added += 1
 
-            # Also index in BM25 for hybrid search
+            # Also index in BM25 for hybrid search (with field-boosted metadata)
             if self._bm25_index:
                 for chunk in batch:
-                    self._bm25_index.add_document(chunk.chunk_id, chunk.content)
+                    # R12: Pass pipeline_name and error_class for field boosting
+                    meta_for_bm25 = {
+                        "pipeline_name": chunk.metadata.get("pipeline_name", ""),
+                        "error_class": chunk.metadata.get("error_class", ""),
+                    }
+                    self._bm25_index.add_document(chunk.chunk_id, chunk.content, metadata=meta_for_bm25)
 
+            batch_added_count = len(batch)
             logger.info("vector_store_batch_added", batch_size=len(batch), total_added=added)
+
+            # R13: Invoke progress callback if provided
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        processed=min(i + batch_size, total),
+                        total=total,
+                        batch_added=batch_added_count,
+                    )
+                except Exception as cb_err:
+                    logger.warning("progress_callback_error", error=str(cb_err))
 
         logger.info("vector_store_indexing_complete", total_added=added, total_docs=self.document_count)
         return added

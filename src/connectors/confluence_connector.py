@@ -59,14 +59,22 @@ class ConfluenceMCPClient(BaseMCPClient):
         query: str,
         space_keys: Optional[list[str]] = None,
         limit: int = 10,
+        max_pages: int = 5,
+        page_size: int = 25,
     ) -> list[dict[str, Any]]:
         """
-        Search Confluence pages using the MCP server.
+        M1: Search Confluence pages with CQL pagination.
+
+        Auto-fetches subsequent pages using `start` + `limit` parameters
+        until `limit` total results are collected or max_pages is reached.
+        Handles the `_links.next` pattern from the Confluence REST API.
 
         Args:
             query: Search text or CQL query
             space_keys: Confluence spaces to search (defaults to configured spaces)
-            limit: Maximum results
+            limit: Total maximum results to return
+            max_pages: Maximum number of API pages to fetch (default 5)
+            page_size: Number of results per API call (default 25)
 
         Returns:
             List of page summaries with id, title, space, and excerpt
@@ -75,14 +83,72 @@ class ConfluenceMCPClient(BaseMCPClient):
         space_filter = " OR ".join([f'space="{sk}"' for sk in spaces])
         cql = f'({space_filter}) AND text ~ "{query}"'
 
-        logger.info("confluence_search", cql=cql[:200], limit=limit)
+        logger.info("confluence_search", cql=cql[:200], limit=limit, max_pages=max_pages)
 
-        result = await self.call_tool(
-            tool_name="search",
-            arguments={"query": cql, "limit": limit},
-        )
+        all_results: list[dict[str, Any]] = []
+        start = 0
+        # Use the smaller of page_size and limit as our per-call batch
+        batch_size = min(page_size, limit)
 
-        return self._parse_search_results(result)
+        for page_num in range(max_pages):
+            result = await self.call_tool(
+                tool_name="search",
+                arguments={
+                    "query": cql,
+                    "limit": batch_size,
+                    "start": start,
+                },
+            )
+
+            page_results = self._parse_search_results(result)
+
+            if not page_results:
+                logger.debug(
+                    "confluence_search_exhausted",
+                    page_num=page_num,
+                    total_so_far=len(all_results),
+                )
+                break
+
+            all_results.extend(page_results)
+
+            logger.debug(
+                "confluence_search_page",
+                page_num=page_num,
+                page_results=len(page_results),
+                total_so_far=len(all_results),
+            )
+
+            if len(all_results) >= limit:
+                break
+
+            # Check for _links.next continuation (Confluence REST API pattern)
+            has_next = False
+            if isinstance(result, dict):
+                links = result.get("_links", {})
+                if isinstance(links, dict) and links.get("next"):
+                    has_next = True
+                # Also check if the raw result carries a size hint
+                result_size = result.get("size", 0)
+                if result_size < batch_size:
+                    has_next = False  # Last page
+            elif isinstance(result, list) and len(page_results) < batch_size:
+                # List response shorter than requested — no more pages
+                has_next = False
+            else:
+                has_next = len(page_results) >= batch_size
+
+            if not has_next:
+                break
+
+            start += batch_size
+            # Adjust batch_size for the final partial page if needed
+            remaining = limit - len(all_results)
+            if remaining <= 0:
+                break
+            batch_size = min(page_size, remaining)
+
+        return all_results[:limit]
 
     async def get_page_content(
         self,
@@ -255,6 +321,119 @@ class ConfluenceMCPClient(BaseMCPClient):
 
         logger.info("confluence_indexed", total_chunks=len(chunks))
         return chunks
+
+    # ─── M4: Per-Connector Health Check ───────────────────
+
+    async def health_check(self) -> dict[str, Any]:
+        """
+        M4: Confluence-specific health check.
+        Pings the MCP /health endpoint and then lists a Confluence space
+        to verify the underlying Confluence instance is reachable.
+        """
+        status = await super().health_check()
+        status["connector"] = "confluence"
+        status["base_url"] = self.base_url
+        status["space_keys"] = self.space_keys
+
+        if status["healthy"]:
+            try:
+                result = await self.call_tool(
+                    tool_name="search",
+                    arguments={"query": "type=space", "limit": 1, "start": 0},
+                )
+                status["confluence_reachable"] = result is not None
+                status["confluence_detail"] = "Space listing succeeded"
+            except Exception as exc:
+                status["confluence_reachable"] = False
+                status["confluence_detail"] = f"{type(exc).__name__}: {exc}"
+
+        return status
+
+    # ─── M9: GraphRAG — Page Link Graph ──────────────────
+
+    async def get_linked_pages(
+        self,
+        page_id: str,
+        depth: int = 1,
+    ) -> dict[str, Any]:
+        """
+        M9: Return the page link graph for a given Confluence page.
+        Useful for GraphRAG dependency mapping across runbook / operational
+        knowledge base pages.
+
+        Args:
+            page_id: Root page ID to start from
+            depth: How many levels of links to traverse (1 = direct links only)
+
+        Returns:
+            Dict with:
+            - root_page_id (str)
+            - links: list of {page_id, title, url, link_type}
+            - children: list of child page summaries (depth=1)
+        """
+        logger.info("confluence_get_linked_pages", page_id=page_id, depth=depth)
+
+        link_graph: dict[str, Any] = {
+            "root_page_id": page_id,
+            "links": [],
+            "children": [],
+        }
+
+        # Fetch direct children of this page
+        try:
+            children_result = await self.call_tool(
+                tool_name="get_child_pages",
+                arguments={"page_id": page_id, "limit": 50},
+            )
+            if isinstance(children_result, list):
+                link_graph["children"] = [
+                    {
+                        "page_id": str(item.get("id", "")),
+                        "title": item.get("title", ""),
+                        "url": (
+                            item.get("_links", {}).get("webui", "")
+                            if isinstance(item.get("_links"), dict) else ""
+                        ),
+                        "link_type": "child",
+                    }
+                    for item in children_result
+                    if isinstance(item, dict)
+                ]
+        except Exception as exc:
+            logger.warning("confluence_children_fetch_failed", page_id=page_id, error=str(exc))
+            link_graph["children_error"] = str(exc)
+
+        # Fetch inline links from the page body (storage format)
+        try:
+            page = await self.get_page_content(page_id, expand="body.storage")
+            body = page.get("body", "")
+            if body:
+                import re as _re
+                # Extract Confluence page links: /pages/viewpage.action?pageId=XXXXX
+                page_id_refs = _re.findall(r'pageId=(\d+)', body)
+                # Also match wiki-style links: <ri:page ri:content-title="...">
+                title_refs = _re.findall(r'ri:content-title="([^"]+)"', body)
+
+                for ref_id in set(page_id_refs):
+                    if ref_id != page_id:
+                        link_graph["links"].append({
+                            "page_id": ref_id,
+                            "title": "",  # Title not available without extra fetch
+                            "url": f"{self.base_url}/pages/viewpage.action?pageId={ref_id}",
+                            "link_type": "inline_page_id",
+                        })
+                for title in set(title_refs):
+                    link_graph["links"].append({
+                        "page_id": "",
+                        "title": title,
+                        "url": "",
+                        "link_type": "inline_title_ref",
+                    })
+        except Exception as exc:
+            logger.warning("confluence_link_extract_failed", page_id=page_id, error=str(exc))
+            link_graph["links_error"] = str(exc)
+
+        return link_graph
 
     # ─── Internal Helpers ─────────────────────────
 

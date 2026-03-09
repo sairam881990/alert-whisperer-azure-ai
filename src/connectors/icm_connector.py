@@ -289,6 +289,268 @@ class ICMMCPClient(BaseMCPClient):
             logger.error("icm_update_failed", ticket_id=ticket_id, error=str(e))
             return False
 
+    # ─── M3: Bulk Incident Updates ────────────────────
+
+    async def bulk_update_incidents(
+        self,
+        ticket_ids: list[str],
+        status: Optional[str] = None,
+        notes: Optional[str] = None,
+        assigned_to: Optional[str] = None,
+        correlation_tag: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        M3: Apply the same update to multiple incidents in batch.
+
+        Useful when correlating related incidents (e.g., a cluster-wide
+        failure affecting many pipeline runs simultaneously).
+
+        Attempts the MCP `bulk_update` tool first; if the server does not
+        support it, falls back to sequential individual updates.
+
+        Args:
+            ticket_ids: List of ICM ticket identifiers to update
+            status: New status for all tickets
+            notes: Notes to append to all tickets
+            assigned_to: Assignee for all tickets
+            correlation_tag: Optional tag to label related incidents
+
+        Returns:
+            Dict with:
+            - succeeded: list of ticket IDs updated successfully
+            - failed: list of {ticket_id, error}
+            - total: int
+        """
+        if not ticket_ids:
+            return {"succeeded": [], "failed": [], "total": 0}
+
+        logger.info(
+            "icm_bulk_update",
+            ticket_count=len(ticket_ids),
+            status=status,
+            assigned_to=assigned_to,
+            correlation_tag=correlation_tag,
+        )
+
+        succeeded: list[str] = []
+        failed: list[dict[str, str]] = []
+
+        # Build the shared update payload
+        update_payload: dict[str, Any] = {}
+        if status:
+            update_payload["status"] = status
+        if notes:
+            update_payload["notes"] = notes
+        if assigned_to:
+            update_payload["assigned_to"] = assigned_to
+        if correlation_tag:
+            update_payload["correlation_tag"] = correlation_tag
+
+        # Try native bulk_update tool first (server may support it)
+        try:
+            await self.call_tool(
+                tool_name="bulk_update_incidents",
+                arguments={
+                    "incident_ids": ticket_ids,
+                    **update_payload,
+                },
+            )
+            logger.info("icm_bulk_update_native", ticket_count=len(ticket_ids))
+            return {
+                "succeeded": ticket_ids,
+                "failed": [],
+                "total": len(ticket_ids),
+                "method": "native_bulk",
+            }
+        except Exception as e:
+            logger.debug(
+                "icm_bulk_update_native_unavailable",
+                error=str(e),
+                fallback="sequential",
+            )
+
+        # Fallback: sequential individual updates
+        for ticket_id in ticket_ids:
+            try:
+                args: dict[str, Any] = {"incident_id": ticket_id, **update_payload}
+                await self.call_tool(tool_name="update_incident", arguments=args)
+                succeeded.append(ticket_id)
+                logger.debug("icm_bulk_update_item_ok", ticket_id=ticket_id)
+            except Exception as exc:
+                failed.append({"ticket_id": ticket_id, "error": str(exc)})
+                logger.warning(
+                    "icm_bulk_update_item_failed",
+                    ticket_id=ticket_id,
+                    error=str(exc),
+                )
+
+        result = {
+            "succeeded": succeeded,
+            "failed": failed,
+            "total": len(ticket_ids),
+            "method": "sequential_fallback",
+        }
+        logger.info(
+            "icm_bulk_update_complete",
+            succeeded=len(succeeded),
+            failed=len(failed),
+            total=len(ticket_ids),
+        )
+        return result
+
+    # ─── M4: Per-Connector Health Check ───────────────────
+
+    async def health_check(self) -> dict[str, Any]:
+        """
+        M4: ICM-specific health check.
+        Pings the MCP /health endpoint and then fetches 1 active incident
+        to verify the ICM service itself is reachable.
+        """
+        status = await super().health_check()
+        status["connector"] = "icm"
+
+        if status["healthy"]:
+            try:
+                result = await self.call_tool(
+                    tool_name="list_incidents",
+                    arguments={"limit": 1, "status": "active"},
+                )
+                status["icm_reachable"] = result is not None
+                status["icm_detail"] = "Incident listing succeeded"
+            except Exception as exc:
+                status["icm_reachable"] = False
+                status["icm_detail"] = f"{type(exc).__name__}: {exc}"
+
+        return status
+
+    # ─── M9: GraphRAG — Incident Correlation Data ──────────
+
+    async def get_related_incidents(
+        self,
+        ticket_id: str,
+        include_historical: bool = True,
+        days_back: int = 30,
+    ) -> dict[str, Any]:
+        """
+        M9: Return incident correlation data for GraphRAG dependency mapping.
+
+        Fetches direct parent/child/related incidents from the ICM API and
+        enriches them with historical similar incidents for graph construction.
+
+        Args:
+            ticket_id: Root incident to start from
+            include_historical: Whether to also search for similar past incidents
+            days_back: Lookback window for historical similarity search
+
+        Returns:
+            Dict with:
+            - root_incident: summary of the root ticket
+            - related: list of directly linked incidents
+            - similar_historical: list of past incidents with similar root cause
+            - correlation_graph: {nodes: [...], edges: [...]}
+        """
+        logger.info("icm_get_related_incidents", ticket_id=ticket_id)
+
+        correlation: dict[str, Any] = {
+            "root_incident_id": ticket_id,
+            "root_incident": None,
+            "related": [],
+            "similar_historical": [],
+            "correlation_graph": {"nodes": [], "edges": []},
+        }
+
+        # Fetch root incident details
+        try:
+            root = await self.get_incident(ticket_id)
+            if root:
+                correlation["root_incident"] = {
+                    "ticket_id": root.ticket_id,
+                    "title": root.title,
+                    "severity": root.severity.value,
+                    "status": root.status.value,
+                    "related_pipeline": root.related_pipeline,
+                    "tags": root.tags,
+                }
+                correlation["correlation_graph"]["nodes"].append({
+                    "id": root.ticket_id,
+                    "type": "root",
+                    "title": root.title,
+                })
+        except Exception as exc:
+            logger.warning("icm_root_incident_fetch_failed", ticket_id=ticket_id, error=str(exc))
+            correlation["root_incident_error"] = str(exc)
+
+        # Fetch directly linked incidents from the MCP server
+        try:
+            related_result = await self.call_tool(
+                tool_name="get_related_incidents",
+                arguments={"incident_id": ticket_id},
+            )
+            related_incidents = self._parse_incident_list(related_result)
+            for inc in related_incidents:
+                correlation["related"].append({
+                    "ticket_id": inc.ticket_id,
+                    "title": inc.title,
+                    "severity": inc.severity.value,
+                    "status": inc.status.value,
+                    "related_pipeline": inc.related_pipeline,
+                })
+                correlation["correlation_graph"]["nodes"].append({
+                    "id": inc.ticket_id,
+                    "type": "related",
+                    "title": inc.title,
+                })
+                correlation["correlation_graph"]["edges"].append({
+                    "source": ticket_id,
+                    "target": inc.ticket_id,
+                    "relationship": "related",
+                })
+        except Exception as exc:
+            logger.debug(
+                "icm_related_incidents_unavailable",
+                ticket_id=ticket_id,
+                error=str(exc),
+            )
+
+        # Optionally enrich with historical similarity
+        if include_historical and correlation.get("root_incident"):
+            root_info = correlation["root_incident"]
+            search_query = root_info.get("title", ticket_id)
+            try:
+                historical = await self.search_historical_incidents(
+                    query=search_query,
+                    days_back=days_back,
+                    limit=10,
+                )
+                for h in historical:
+                    if h.incident_id != ticket_id:
+                        correlation["similar_historical"].append({
+                            "incident_id": h.incident_id,
+                            "title": h.title,
+                            "root_cause": h.root_cause,
+                            "resolution": h.resolution[:300] if h.resolution else "",
+                            "pipeline_name": h.pipeline_name,
+                            "occurred_at": h.occurred_at.isoformat(),
+                        })
+                        correlation["correlation_graph"]["nodes"].append({
+                            "id": h.incident_id,
+                            "type": "historical_similar",
+                            "title": h.title,
+                        })
+                        correlation["correlation_graph"]["edges"].append({
+                            "source": ticket_id,
+                            "target": h.incident_id,
+                            "relationship": "historically_similar",
+                        })
+            except Exception as exc:
+                logger.warning(
+                    "icm_historical_similarity_failed",
+                    ticket_id=ticket_id,
+                    error=str(exc),
+                )
+
+        return correlation
+
     # ─── Internal Parsers ─────────────────────────
 
     def _parse_incident(self, raw: Any) -> Optional[ICMTicket]:

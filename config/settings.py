@@ -38,6 +38,12 @@ class KustoSettings(BaseSettings):
     database: str = Field(description="Default Kusto database name")
     mcp_server_url: str = Field(default="http://localhost:3001", description="Kusto MCP Server endpoint")
     query_timeout_seconds: int = Field(default=120, description="Query timeout in seconds")
+    # M2: Streaming query defaults
+    stream_batch_size: int = Field(default=1000, description="Rows per batch when streaming query results (M2)")
+    stream_max_batches: int = Field(default=20, description="Maximum batches to fetch when streaming (M2)")
+    # M7: Circuit breaker
+    circuit_breaker_threshold: int = Field(default=5, description="Consecutive failures before circuit opens (M7)")
+    circuit_breaker_cooldown_seconds: float = Field(default=60.0, description="Cooldown before circuit half-opens (M7)")
 
 
 class ConfluenceSettings(BaseSettings):
@@ -50,6 +56,12 @@ class ConfluenceSettings(BaseSettings):
     api_token: SecretStr = Field(description="Confluence API token")
     mcp_server_url: str = Field(default="http://localhost:3002", description="Confluence MCP Server endpoint")
     space_keys: list[str] = Field(default=["RUNBOOKS", "OPS", "DE"], description="Confluence space keys to search")
+    # M1: Pagination defaults
+    search_max_pages: int = Field(default=5, description="Max API pages to fetch per search call (M1)")
+    search_page_size: int = Field(default=25, description="Results per API page for search (M1)")
+    # M7: Circuit breaker
+    circuit_breaker_threshold: int = Field(default=5, description="Consecutive failures before circuit opens (M7)")
+    circuit_breaker_cooldown_seconds: float = Field(default=60.0, description="Cooldown before circuit half-opens (M7)")
 
 
 class ICMSettings(BaseSettings):
@@ -61,6 +73,9 @@ class ICMSettings(BaseSettings):
     api_base_url: str = Field(default="", description="ICM REST API base URL")
     api_key: SecretStr = Field(default=SecretStr(""), description="ICM API key if required")
     poll_interval_seconds: int = Field(default=30, description="Polling interval for new incidents")
+    # M7: Circuit breaker
+    circuit_breaker_threshold: int = Field(default=5, description="Consecutive failures before circuit opens (M7)")
+    circuit_breaker_cooldown_seconds: float = Field(default=60.0, description="Cooldown before circuit half-opens (M7)")
 
 
 class LogAnalyticsSettings(BaseSettings):
@@ -71,6 +86,41 @@ class LogAnalyticsSettings(BaseSettings):
     workspace_id: str = Field(description="Log Analytics Workspace ID")
     mcp_server_url: str = Field(default="http://localhost:3004", description="Log Analytics MCP Server endpoint")
     default_timespan: str = Field(default="P1D", description="Default query timespan (ISO 8601 duration)")
+    # M7: Circuit breaker
+    circuit_breaker_threshold: int = Field(default=5, description="Consecutive failures before circuit opens (M7)")
+    circuit_breaker_cooldown_seconds: float = Field(default=60.0, description="Cooldown before circuit half-opens (M7)")
+    indexing_batch_size: int = Field(
+        default=10000,
+        description=(
+            "Number of log records to fetch per batch during RAG indexing. "
+            "Production default is 10000; increase for larger workspaces. "
+            "Controlled by LOG_ANALYTICS_INDEXING_BATCH_SIZE env var."
+        ),
+    )
+    indexing_max_batches: int = Field(
+        default=10,
+        description=(
+            "Maximum number of pagination batches during a single indexing run. "
+            "Total records indexed = indexing_batch_size * indexing_max_batches. "
+            "Controlled by LOG_ANALYTICS_INDEXING_MAX_BATCHES env var."
+        ),
+    )
+    volume_warn_threshold: int = Field(
+        default=50000,
+        description=(
+            "If a count query estimates more than this many rows, emit a warning "
+            "before fetching to prevent overwhelming the indexing pipeline. "
+            "Controlled by LOG_ANALYTICS_VOLUME_WARN_THRESHOLD env var."
+        ),
+    )
+    volume_hard_limit: int = Field(
+        default=500000,
+        description=(
+            "Hard cap on rows returned from any single query. Results are "
+            "truncated to this value to protect downstream memory. "
+            "Controlled by LOG_ANALYTICS_VOLUME_HARD_LIMIT env var."
+        ),
+    )
 
 
 class LLMSettings(BaseSettings):
@@ -87,6 +137,32 @@ class LLMSettings(BaseSettings):
     embedding_dimensions: int = Field(default=3072, description="Embedding vector dimensions")
     temperature: float = Field(default=0.1, description="Default temperature for completions")
     max_tokens: int = Field(default=4096, description="Max tokens for completions")
+    # P8: Single configurable temperature for DSPy optimizer — overrides all per-signature
+    # hardcoded values. Set via LLM_DSPY_OPTIMIZATION_TEMPERATURE environment variable.
+    dspy_optimization_temperature: float = Field(
+        default=0.1,
+        description=(
+            "P8: Normalized temperature used by the DSPy prompt optimizer for all technique "
+            "signatures. Eliminates the 0.1/0.2/0.3 inconsistency. Should match `temperature` "
+            "unless you intentionally want lower variance during optimization."
+        ),
+    )
+    # P12: LLM call timeout in seconds. Set via LLM_TIMEOUT_SECONDS.
+    timeout_seconds: float = Field(
+        default=30.0,
+        description=(
+            "P12: Maximum seconds to wait for an LLM API response before raising TimeoutError. "
+            "Set to 0 to disable timeout enforcement."
+        ),
+    )
+    # P11: Maximum token budget for conversation history in prompts.
+    conversation_token_budget: int = Field(
+        default=8000,
+        description=(
+            "P11: Maximum number of tokens (approx. chars/4) to keep in conversation history "
+            "when building conversational prompts. Older messages are dropped first."
+        ),
+    )
 
 
 class TeamsSettings(BaseSettings):
@@ -145,6 +221,30 @@ class RAGSettings(BaseSettings):
     semantic_chunking_percentile: float = Field(
         default=25.0,
         description="Percentile cutoff for semantic chunking breakpoint detection (lower = fewer, larger chunks)",
+    )
+    rag_fusion_k: int = Field(
+        default=60,
+        description="Reciprocal Rank Fusion constant k (higher = less rank sensitivity). "
+                    "Standard value is 60 (original RRF paper). Increase for large result sets.",
+    )
+    cross_encoder_latency_budget_ms: int = Field(
+        default=3000,
+        description="Max latency budget in milliseconds for LLM-as-reranker cross-encoder path. "
+                    "Calls exceeding this limit fall back to heuristic reranking.",
+    )
+    self_rag_runbook_threshold: float = Field(
+        default=0.4,
+        description="Self-RAG relevance threshold for runbook (confluence) source type. "
+                    "Lower than default since partial runbook matches are valuable.",
+    )
+    self_rag_incident_threshold: float = Field(
+        default=0.7,
+        description="Self-RAG relevance threshold for incident (icm) source type. "
+                    "Stricter than default to avoid false positive incident matches.",
+    )
+    parent_overlap_tokens: int = Field(
+        default=100,
+        description="Token overlap between parent chunks to avoid losing context at boundaries.",
     )
 
 

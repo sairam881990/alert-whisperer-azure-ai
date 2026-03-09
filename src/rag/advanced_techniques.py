@@ -61,20 +61,106 @@ class CrossEncoderReranker:
     - ~15-20% precision improvement on retrieval benchmarks by rescoring
       the top-K candidates from the initial bi-encoder retrieval.
 
-    Implementation:
-    - Primary: LLM-as-reranker (GPT-4o-mini for low latency)
-    - Fallback: Metadata-weighted heuristic scoring
+    Implementation paths (ordered by preference):
+    1. Azure AI Search semantic reranking (server-side L2 cross-encoder) —
+       handled natively in vector_store.py, zero client-side latency.
+    2. Dedicated cross-encoder model (e.g., ms-marco-MiniLM-L-12-v2 via
+       sentence-transformers) — ~15-30 ms per (query, doc) pair on GPU,
+       ~80-120 ms on CPU. Best precision/latency trade-off when Azure
+       semantic reranking is disabled.
+    3. LLM-as-reranker (GPT-4o-mini) — ~200-500 ms per chunk due to
+       full LLM inference round-trip. Higher cost, but more nuanced
+       relevance reasoning. Use when dedicated model is unavailable.
+    4. Heuristic fallback — keyword overlap + metadata weighting,
+       zero external calls. Used when no model is available.
+
+    Latency note:
+    The LLM-as-reranker path (option 3) adds ~200-500 ms PER CHUNK to the
+    retrieval pipeline. For 10 candidate chunks, that's 2-5 seconds of
+    additional latency on top of the initial search. In contrast, a dedicated
+    cross-encoder model (option 2) processes the same 10 chunks in ~150-300 ms
+    total (batch inference). For production deployments where sub-second
+    post-retrieval latency is critical, switch to the dedicated model path
+    by setting `use_dedicated_model=True` and providing a local model path.
     """
+
+    # Dedicated cross-encoder model for low-latency reranking
+    # To use: pip install sentence-transformers
+    # Then set use_dedicated_model=True in constructor
+    DEDICATED_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"
 
     def __init__(
         self,
         llm_client: Any = None,
         model: str = "gpt-4o-mini",
         top_n: int = 5,
+        use_dedicated_model: bool = False,
+        dedicated_model_path: Optional[str] = None,
     ):
         self.llm_client = llm_client
         self.model = model
         self.top_n = top_n
+        self.use_dedicated_model = use_dedicated_model
+        self._dedicated_model: Optional[Any] = None
+
+        if use_dedicated_model:
+            self._load_dedicated_model(dedicated_model_path)
+
+    def _load_dedicated_model(self, model_path: Optional[str] = None) -> None:
+        """
+        Load a dedicated cross-encoder model for low-latency reranking.
+
+        Requires: pip install sentence-transformers
+        Default model: cross-encoder/ms-marco-MiniLM-L-12-v2
+        """
+        try:
+            from sentence_transformers import CrossEncoder
+            path = model_path or self.DEDICATED_MODEL_NAME
+            self._dedicated_model = CrossEncoder(path)
+            logger.info("dedicated_cross_encoder_loaded", model=path)
+        except ImportError:
+            logger.warning(
+                "sentence_transformers_not_installed",
+                msg="pip install sentence-transformers to use dedicated cross-encoder. "
+                    "Falling back to LLM-as-reranker.",
+            )
+            self.use_dedicated_model = False
+        except Exception as e:
+            logger.error("dedicated_model_load_error", error=str(e))
+            self.use_dedicated_model = False
+
+    def _dedicated_rerank(
+        self,
+        query: str,
+        chunks: list[DocumentChunk],
+    ) -> list[tuple[float, DocumentChunk]]:
+        """
+        Rerank using the dedicated cross-encoder model (batch inference).
+
+        Processes all (query, document) pairs in a single batch call,
+        yielding ~10-50x lower latency than LLM-as-reranker for typical
+        candidate set sizes (5-20 chunks).
+
+        Typical latency:
+        - GPU: ~15-30 ms per pair, ~150-300 ms total for 10 chunks
+        - CPU: ~80-120 ms per pair, ~800-1200 ms total for 10 chunks
+        """
+        if not self._dedicated_model:
+            return self._heuristic_rerank(query, chunks)
+
+        pairs = [(query[:300], chunk.content[:800]) for chunk in chunks]
+        try:
+            scores = self._dedicated_model.predict(pairs)
+            scored = []
+            for chunk, score in zip(chunks, scores):
+                normalized = float(1 / (1 + __import__('math').exp(-score)))  # sigmoid
+                chunk.metadata["reranker_score"] = round(normalized, 4)
+                chunk.metadata["reranker_method"] = "dedicated_cross_encoder"
+                scored.append((normalized, chunk))
+            return scored
+        except Exception as e:
+            logger.error("dedicated_rerank_error", error=str(e))
+            return self._heuristic_rerank(query, chunks)
 
     RERANK_PROMPT = (
         "You are a relevance scorer for data pipeline troubleshooting documentation.\n\n"
@@ -106,7 +192,9 @@ class CrossEncoderReranker:
         if not chunks:
             return []
 
-        if self.llm_client:
+        if self.use_dedicated_model and self._dedicated_model:
+            scored = self._dedicated_rerank(query, chunks)
+        elif self.llm_client:
             scored = await self._llm_rerank(query, chunks)
         else:
             scored = self._heuristic_rerank(query, chunks)
@@ -115,11 +203,16 @@ class CrossEncoderReranker:
         scored.sort(key=lambda x: x[0], reverse=True)
         result = [chunk for _, chunk in scored[:self.top_n]]
 
+        method = (
+            "dedicated_cross_encoder" if (self.use_dedicated_model and self._dedicated_model)
+            else "llm" if self.llm_client
+            else "heuristic"
+        )
         logger.info(
             "cross_encoder_reranking_complete",
             input_chunks=len(chunks),
             output_chunks=len(result),
-            method="llm" if self.llm_client else "heuristic",
+            method=method,
         )
         return result
 

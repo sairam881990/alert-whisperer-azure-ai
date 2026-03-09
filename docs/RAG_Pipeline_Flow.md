@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Alert Whisperer RAG (Retrieval-Augmented Generation) pipeline processes user queries through a sophisticated multi-stage system that combines 11 distinct techniques across 4 phases. This document explains how a query flows from the user's input through to the final generated response, detailing when and why each technique is invoked.
+The Alert Whisperer RAG (Retrieval-Augmented Generation) pipeline processes user queries through a sophisticated multi-stage system that combines 13 distinct techniques across 4 phases. This document explains how a query flows from the user's input through to the final generated response, detailing when and why each technique is invoked.
 
 ---
 
@@ -48,6 +48,11 @@ User Query
 │  ┌──────────────────▼──────────────────────┐  │
 │  │ Parent-Child Chunk Expansion            │  │
 │  │ (child retrieval → parent context)      │  │
+│  └──────────────────┬──────────────────────┘  │
+│                     │                         │
+│  ┌──────────────────▼──────────────────────┐  │
+│  │ Semantic Chunking                       │  │
+│  │ (embedding-similarity boundary detect)  │  │
 │  └──────────────────┬──────────────────────┘  │
 └──────────────────────┬────────────────────────┘
                        │
@@ -258,6 +263,29 @@ Plans which data sources to query based on the query intent:
 
 **Code path:** `ParentChildChunkManager.create_parent_child_chunks()` → `VectorStore.add_documents_with_parent_child()`
 
+### 2.4 Semantic Chunking
+
+**When it fires:** During document indexing (alternative to fixed-token chunking)
+
+**What it does:**
+1. Splits document text into sentences
+2. Embeds each sentence using text-embedding-3-large (3072 dims)
+3. Computes cosine similarity between consecutive sentence embeddings
+4. Identifies similarity drops below a percentile threshold (default: 25th percentile)
+5. Groups sentences between breakpoints into semantically coherent chunks
+6. Enforces min/max token limits (100-800 tokens) to avoid degenerate chunks
+
+**Why it matters for Spark/Synapse/Kusto:**
+Fixed-size token chunking splits mid-concept — a 450-token chunk might cut between "Root Cause" and "Resolution" sections of a Confluence runbook, losing the cause→fix linkage. Semantic chunking keeps related content together by detecting topic boundaries via embedding similarity. Spark error logs follow irregular structure — semantic chunking keeps a stack trace + its root cause summary together as one unit.
+
+**Fallback:** When the embedding client is unavailable, falls back to token-based splitting (max_chunk_tokens=800, overlap=50).
+
+**Code path:** `SemanticChunker.chunk()` → `VectorStore.add_documents_with_semantic_chunking()`
+
+**Configuration:**
+- `RAG_SEMANTIC_CHUNKING_ENABLED` — Enable/disable (default: `true`)
+- `RAG_SEMANTIC_CHUNKING_PERCENTILE` — Breakpoint percentile threshold (default: `25.0`)
+
 ---
 
 ## Phase 3: Post-Retrieval
@@ -307,15 +335,31 @@ Affected components: ADLS Gen2 Curated Zone
 
 **Code path:** `GraphRAGEngine.get_related_context()` → `GraphRAGEngine.trace_blast_radius()` + `GraphRAGEngine.find_failure_chain()`
 
+**Dynamic Graph Population:**
+In production, the static default graph is replaced with live pipeline topology from ADF, Databricks, and Synapse metadata APIs. Call `GraphRAGEngine.refresh_from_live_metadata()` on application startup or on a schedule (e.g., hourly) to keep the graph current. Supported sources:
+- Azure Data Factory: Extracts pipeline activities, dataset dependencies, and inter-pipeline edges
+- Databricks: Extracts job definitions, task dependencies, and cluster references
+- Synapse: Extracts pipeline activities, SQL pool references, and dataset chains
+
+**Code path (dynamic):** `GraphRAGEngine.refresh_from_live_metadata()` → `_extract_adf_topology()` / `_extract_databricks_topology()` / `_extract_synapse_topology()`
+
 ### 3.3 Cross-Encoder Reranking
 
 **When it fires:** After CRAG filtering and GraphRAG context injection
 
-**What it does:**
-Rescores each chunk by attending to the (query, document) pair JOINTLY — unlike bi-encoder embedding which encodes them independently. This catches fine-grained relevance signals:
+**Implementation paths (by priority):**
+1. **Azure AI Search Semantic Reranking** (server-side L2 cross-encoder) — zero client-side latency, handled in `VectorStore._search_azure()`
+2. **Dedicated Cross-Encoder Model** (`ms-marco-MiniLM-L-12-v2` via `sentence-transformers`) — ~150-300ms total for 10 chunks (batch inference). Enable with `RAG_USE_DEDICATED_RERANKER=true`.
+3. **LLM-as-Reranker** (GPT-4o-mini) — ~200-500ms per chunk, 2-5s total for 10 chunks. Higher cost but more nuanced relevance reasoning.
+4. **Heuristic Fallback** — keyword overlap + metadata weighting, zero external calls.
 
-1. **LLM Reranker** (primary) — Uses GPT-4o-mini to score each (query, doc) pair from 0.0 to 1.0
-2. **Heuristic Reranker** (fallback) — Keyword overlap + metadata boosting
+**Latency comparison:**
+| Method | Latency (10 chunks) | Precision | Cost |
+|---|---|---|---|
+| Azure Semantic Reranking | ~0ms (server-side) | High | Included in search pricing |
+| Dedicated Cross-Encoder | ~150-300ms | High | Local compute only |
+| LLM-as-Reranker (GPT-4o-mini) | ~2-5 seconds | Highest | Per-token API cost |
+| Heuristic | ~1-5ms | Medium | Zero |
 
 **Precision improvement:** ~15-20% over bi-encoder scoring alone.
 
@@ -399,6 +443,7 @@ For an alert-triggered query (e.g., a Spark OOM error is detected):
    └─ Semantic Reranking (L2)
 6. Agentic Source Routing          → 0-50ms   (intent classification)
 7. Parent-Child Expansion          → 0-5ms    (in-memory lookup)
+7.5 Semantic Chunking             → At indexing time (not per-query)
 8. CRAG Grading + Filtering        → 1-10ms   (heuristic) or 200-500ms (LLM judge)
 9. GraphRAG Context Injection      → 0-5ms    (graph traversal)
 10. Cross-Encoder Reranking        → 1-10ms   (heuristic) or 200-500ms (LLM)
@@ -432,6 +477,8 @@ Each technique can be independently enabled/disabled via environment variables:
 | FLARE | Enabled when VectorStore is available | `true` |
 | Self-RAG | `RAG_SELF_RAG_ENABLED` | `true` |
 | Semantic Reranking | `RAG_SEMANTIC_RERANKING_ENABLED` | `true` |
+| Semantic Chunking | `RAG_SEMANTIC_CHUNKING_ENABLED` | `true` |
+| Dedicated Cross-Encoder | `RAG_USE_DEDICATED_RERANKER` | `false` |
 
 ---
 
@@ -444,3 +491,5 @@ The system is designed to gracefully degrade:
 3. **LLM client unavailable** → Query Rewriting uses only synonym/abbreviation expansion (no LLM); Cross-Encoder uses heuristic scoring; CRAG uses token overlap; Self-RAG uses heuristic evaluation
 4. **tiktoken unavailable** → Token-based chunking falls back to character-based (~4 chars/token estimate)
 5. **Graph config missing** → GraphRAG uses built-in default pipeline dependency graph
+6. **Semantic chunking unavailable** → Falls back to token-based splitting (400-512 tokens per child chunk)
+7. **Dedicated cross-encoder unavailable** → Falls back to LLM-as-reranker, then to heuristic scoring

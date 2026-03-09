@@ -8,6 +8,7 @@ Enhanced with:
 - Azure AI Search native hybrid search (vector + keyword BM25)
 - Azure AI Search semantic reranking (L2 cross-encoder)
 - Parent-Child Chunking with token-based splitting (400-512 tokens)
+- Semantic Chunking with embedding-similarity boundary detection
 - BM25 in-memory fallback for local dev / offline mode
 - text-embedding-3-large (3072-dimensional) embeddings via OpenAI SDK
 """
@@ -63,6 +64,13 @@ try:
 except ImportError:
     _AZURE_SEARCH_AVAILABLE = False
     logger.info("azure_search_sdk_not_installed", msg="Using in-memory fallback store")
+
+try:
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    _NUMPY_AVAILABLE = False
+    logger.info("numpy_not_installed", msg="Semantic chunking will use pure-Python fallback")
 
 try:
     from openai import AsyncOpenAI
@@ -464,6 +472,264 @@ class ParentChildChunkManager:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Semantic Chunking (Embedding-Similarity Boundary Detection)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class SemanticChunker:
+    """
+    Splits text into semantically coherent chunks by detecting topic
+    boundaries via embedding similarity drops between consecutive sentences.
+
+    Why Semantic Chunking for Spark/Synapse/Kusto troubleshooting:
+    - Fixed-size token chunking splits mid-concept: a 450-token chunk might
+      cut between "Root Cause" and "Resolution" sections of a Confluence
+      runbook, losing the cause→fix linkage that the support engineer needs.
+    - Spark error logs follow irregular structure — a stack trace may be
+      15 lines followed by a single-line root cause summary. Semantic
+      chunking keeps the stack trace + summary together as one unit.
+    - ICM incidents have variable-length sections (short Title vs long
+      Description vs medium Resolution). Semantic boundaries respect these
+      natural section breaks rather than forcing arbitrary 400-token cuts.
+    - Kusto ingestion error docs interleave KQL examples with prose
+      explanations — semantic chunking detects the transition between
+      code and text, keeping code blocks intact.
+
+    Algorithm:
+    1. Split text into sentences (or small blocks)
+    2. Embed each sentence using text-embedding-3-large
+    3. Compute cosine similarity between consecutive sentence embeddings
+    4. Identify similarity drops below a threshold (breakpoints)
+    5. Group sentences between breakpoints into semantic chunks
+    6. Enforce min/max token limits to avoid degenerate chunks
+    """
+
+    def __init__(
+        self,
+        embedding_client: Optional["EmbeddingClient"] = None,
+        similarity_threshold: float = 0.45,
+        min_chunk_tokens: int = 100,
+        max_chunk_tokens: int = 800,
+        percentile_cutoff: float = 25.0,
+    ):
+        """
+        Args:
+            embedding_client: EmbeddingClient instance for generating embeddings.
+            similarity_threshold: Absolute similarity floor; drops below this
+                always trigger a split. Ignored when percentile_cutoff is used.
+            min_chunk_tokens: Minimum tokens per chunk (avoids tiny fragments).
+            max_chunk_tokens: Maximum tokens per chunk (forces a split even
+                without a similarity drop).
+            percentile_cutoff: Use the Nth percentile of all pairwise
+                similarities as the dynamic breakpoint threshold. Lower
+                values create fewer, larger chunks. Set to 0 to disable.
+        """
+        self.embedding_client = embedding_client
+        self.similarity_threshold = similarity_threshold
+        self.min_chunk_tokens = min_chunk_tokens
+        self.max_chunk_tokens = max_chunk_tokens
+        self.percentile_cutoff = percentile_cutoff
+
+    async def chunk(
+        self,
+        text: str,
+        doc_id: str = "",
+    ) -> list[str]:
+        """
+        Split *text* into semantically coherent chunks.
+
+        Falls back to token-based splitting if the embedding client is
+        unavailable or the text is too short to benefit from semantic
+        boundary detection.
+
+        Returns:
+            List of chunk strings, each within [min_chunk_tokens,
+            max_chunk_tokens] where possible.
+        """
+        # Step 1: Sentence segmentation
+        sentences = self._segment_sentences(text)
+        if len(sentences) <= 3:
+            # Too few sentences for meaningful boundary detection
+            return [text]
+
+        # Step 2: Embed all sentences
+        embeddings = await self._embed_sentences(sentences)
+        if embeddings is None:
+            # Fallback: token-based chunking
+            logger.info("semantic_chunker_fallback", reason="embedding_unavailable", doc_id=doc_id)
+            return ParentChildChunkManager._split_text_by_tokens(
+                text, self.max_chunk_tokens, overlap_tokens=50
+            )
+
+        # Step 3: Compute consecutive cosine similarities
+        similarities = self._consecutive_similarities(embeddings)
+
+        # Step 4: Find breakpoints (similarity drops)
+        breakpoints = self._find_breakpoints(similarities)
+
+        # Step 5: Build chunks from breakpoints
+        chunks = self._build_chunks_from_breakpoints(sentences, breakpoints)
+
+        logger.info(
+            "semantic_chunking_complete",
+            doc_id=doc_id,
+            sentences=len(sentences),
+            breakpoints=len(breakpoints),
+            chunks=len(chunks),
+        )
+        return chunks
+
+    # ── Internal helpers ──────────────────────────
+
+    @staticmethod
+    def _segment_sentences(text: str) -> list[str]:
+        """
+        Split text into sentences. Handles common edge cases:
+        - Abbreviated tokens (e.g., "e.g.", "i.e.")
+        - Code blocks / stack traces (newline-delimited)
+        - Numbered lists ("1. First step")
+        """
+        # First, try splitting on double-newlines (paragraph boundaries)
+        paragraphs = re.split(r'\n\s*\n', text.strip())
+        sentences: list[str] = []
+
+        for para in paragraphs:
+            # Within each paragraph, split on sentence-ending punctuation
+            para_sentences = re.split(
+                r'(?<=[.!?])\s+(?=[A-Z0-9])',
+                para.strip(),
+            )
+            for sent in para_sentences:
+                sent = sent.strip()
+                if sent:
+                    sentences.append(sent)
+
+        return sentences
+
+    async def _embed_sentences(
+        self,
+        sentences: list[str],
+    ) -> Optional[list[list[float]]]:
+        """Embed all sentences. Returns None if client unavailable."""
+        if not self.embedding_client or not self.embedding_client._client:
+            return None
+
+        try:
+            return await self.embedding_client.embed(sentences)
+        except Exception as e:
+            logger.warning("semantic_chunker_embed_error", error=str(e))
+            return None
+
+    @staticmethod
+    def _cosine_sim(a: list[float], b: list[float]) -> float:
+        """Cosine similarity between two vectors (pure Python or NumPy)."""
+        if _NUMPY_AVAILABLE:
+            a_arr = np.array(a, dtype=np.float32)
+            b_arr = np.array(b, dtype=np.float32)
+            dot = np.dot(a_arr, b_arr)
+            norm = np.linalg.norm(a_arr) * np.linalg.norm(b_arr)
+            return float(dot / norm) if norm > 0 else 0.0
+        else:
+            dot = sum(x * y for x, y in zip(a, b))
+            norm_a = math.sqrt(sum(x * x for x in a))
+            norm_b = math.sqrt(sum(x * x for x in b))
+            return dot / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
+
+    def _consecutive_similarities(
+        self,
+        embeddings: list[list[float]],
+    ) -> list[float]:
+        """Compute cosine similarity between embedding[i] and embedding[i+1]."""
+        sims = []
+        for i in range(len(embeddings) - 1):
+            sims.append(self._cosine_sim(embeddings[i], embeddings[i + 1]))
+        return sims
+
+    def _find_breakpoints(self, similarities: list[float]) -> list[int]:
+        """
+        Identify indices where a topic boundary likely occurs.
+
+        Uses dynamic percentile-based thresholding when percentile_cutoff > 0,
+        otherwise falls back to the absolute similarity_threshold.
+
+        Returns:
+            Sorted list of indices into *similarities* that mark breakpoints.
+        """
+        if not similarities:
+            return []
+
+        # Determine threshold
+        if self.percentile_cutoff > 0 and _NUMPY_AVAILABLE:
+            threshold = float(np.percentile(similarities, self.percentile_cutoff))
+        elif self.percentile_cutoff > 0:
+            sorted_sims = sorted(similarities)
+            idx = int(len(sorted_sims) * self.percentile_cutoff / 100.0)
+            idx = max(0, min(idx, len(sorted_sims) - 1))
+            threshold = sorted_sims[idx]
+        else:
+            threshold = self.similarity_threshold
+
+        breakpoints = [
+            i for i, sim in enumerate(similarities) if sim < threshold
+        ]
+        return breakpoints
+
+    def _build_chunks_from_breakpoints(
+        self,
+        sentences: list[str],
+        breakpoints: list[int],
+    ) -> list[str]:
+        """
+        Group sentences between breakpoints into chunks, enforcing
+        min_chunk_tokens and max_chunk_tokens.
+        """
+        if not breakpoints:
+            return [" ".join(sentences)]
+
+        # Create initial groups
+        groups: list[list[str]] = []
+        prev = 0
+        for bp in breakpoints:
+            group_end = bp + 1  # breakpoint index is similarity between [bp] and [bp+1]
+            groups.append(sentences[prev:group_end])
+            prev = group_end
+        if prev < len(sentences):
+            groups.append(sentences[prev:])
+
+        # Merge tiny groups into neighbours (enforce min_chunk_tokens)
+        merged: list[str] = []
+        buffer = ""
+        for group in groups:
+            text = " ".join(group)
+            candidate = f"{buffer} {text}".strip() if buffer else text
+            tokens = _count_tokens(candidate)
+
+            if tokens < self.min_chunk_tokens:
+                buffer = candidate
+                continue
+
+            if tokens > self.max_chunk_tokens:
+                # Force-split oversized candidate using token splitter
+                if buffer:
+                    merged.append(buffer)
+                    buffer = ""
+                sub_chunks = ParentChildChunkManager._split_text_by_tokens(
+                    text, self.max_chunk_tokens, overlap_tokens=30
+                )
+                merged.extend(sub_chunks)
+            else:
+                merged.append(candidate)
+                buffer = ""
+
+        if buffer:
+            if merged:
+                merged[-1] = f"{merged[-1]} {buffer}"
+            else:
+                merged.append(buffer)
+
+        return [c for c in merged if c.strip()]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Azure AI Search Vector Store
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -558,6 +824,14 @@ class VectorStore:
 
         # Parent-child chunk manager (token-based)
         self._parent_child_manager = ParentChildChunkManager()
+
+        # Semantic chunker (embedding-similarity boundary detection)
+        self._semantic_chunker = SemanticChunker(
+            embedding_client=self._embedding_client,
+            min_chunk_tokens=100,
+            max_chunk_tokens=800,
+            percentile_cutoff=25.0,
+        )
 
         logger.info(
             "vector_store_initialized",
@@ -779,6 +1053,65 @@ class VectorStore:
             indexed=added,
         )
         return added
+
+    async def add_documents_with_semantic_chunking(
+        self,
+        doc_id: str,
+        content: str,
+        source_type: str,
+        source_id: str,
+        source_title: str,
+    ) -> int:
+        """
+        Add a document using SEMANTIC CHUNKING — splits on embedding-
+        similarity drops rather than fixed token windows.
+
+        Best for:
+        - Long-form Confluence runbooks with distinct sections
+        - ICM incidents where section lengths vary widely
+        - Kusto docs that interleave KQL code with prose
+
+        Falls back to token-based parent-child chunking when the
+        embedding client is unavailable.
+
+        Returns:
+            Number of chunks indexed.
+        """
+        semantic_texts = await self._semantic_chunker.chunk(
+            text=content,
+            doc_id=doc_id,
+        )
+
+        chunks = []
+        for idx, text in enumerate(semantic_texts):
+            chunk = DocumentChunk(
+                chunk_id=f"{doc_id}_semantic_{idx}",
+                source_type=source_type,
+                source_id=source_id,
+                source_title=source_title,
+                content=text,
+                metadata={
+                    "chunking_strategy": "semantic",
+                    "chunk_index": str(idx),
+                    "token_count": str(_count_tokens(text)),
+                },
+            )
+            chunks.append(chunk)
+
+        added = await self.add_documents(chunks)
+
+        logger.info(
+            "semantic_chunking_indexing_complete",
+            doc_id=doc_id,
+            semantic_chunks=len(chunks),
+            indexed=added,
+        )
+        return added
+
+    @property
+    def semantic_chunker(self) -> SemanticChunker:
+        """Access the semantic chunker."""
+        return self._semantic_chunker
 
     async def search(
         self,
@@ -1142,5 +1475,6 @@ class VectorStore:
             "vector_dimensions": self.VECTOR_DIMENSIONS,
             "hybrid_search_enabled": self._hybrid_enabled,
             "semantic_reranking": self._azure_search_enabled,
+            "semantic_chunking_available": self._semantic_chunker is not None,
             "bm25_indexed": self._bm25_index.document_count if self._bm25_index else 0,
         }

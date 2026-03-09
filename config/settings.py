@@ -124,10 +124,28 @@ class RAGSettings(BaseSettings):
     hybrid_alpha: float = Field(default=0.6, description="Weight for vector vs BM25 (0.6 = 60% vector)")
     # Technique toggles
     rerank_enabled: bool = Field(default=True, description="Enable cross-encoder reranking")
+    use_dedicated_reranker: bool = Field(
+        default=False,
+        description="Use dedicated cross-encoder model (ms-marco-MiniLM-L-12-v2) instead of LLM-as-reranker. "
+                    "Lower latency (~150-300ms vs 2-5s for 10 chunks) but requires sentence-transformers.",
+    )
+    dedicated_reranker_model: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L-12-v2",
+        description="HuggingFace model ID or local path for the dedicated cross-encoder",
+    )
     query_rewriting_enabled: bool = Field(default=True, description="Enable query rewriting")
     rag_fusion_enabled: bool = Field(default=True, description="Enable RAG Fusion")
     self_rag_enabled: bool = Field(default=True, description="Enable Self-RAG evaluation")
     semantic_reranking_enabled: bool = Field(default=True, description="Enable Azure AI Search semantic reranking")
+    semantic_chunking_enabled: bool = Field(
+        default=True,
+        description="Enable semantic chunking (embedding-similarity boundary detection). "
+                    "Falls back to token-based chunking when embedding client is unavailable.",
+    )
+    semantic_chunking_percentile: float = Field(
+        default=25.0,
+        description="Percentile cutoff for semantic chunking breakpoint detection (lower = fewer, larger chunks)",
+    )
 
 
 class RoutingSettings(BaseSettings):

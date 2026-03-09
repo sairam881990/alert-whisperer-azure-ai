@@ -473,6 +473,33 @@ Example: "confluence_spark_oom_runbook_parent_0_child_2"
 
 ---
 
+### 5.7 Semantic Chunking Schema
+
+Documents indexed via semantic chunking (`VectorStore.add_documents_with_semantic_chunking()`) use the same Azure AI Search index but with different metadata:
+
+**Chunk-level metadata (differs from parent-child):**
+| Field | Type | Value | Purpose |
+|---|---|---|---|
+| `chunk_id` | String (key) | `{doc_id}_semantic_{index}` | Unique identifier |
+| `chunking_strategy` | String | `"semantic"` | Identifies chunking method used |
+| `chunk_index` | String | `"0"`, `"1"`, ... | Position within the document |
+| `token_count` | String | `"150"`, `"400"`, ... | Actual token count of this chunk |
+
+**Key differences from parent-child chunking:**
+| Property | Parent-Child | Semantic |
+|---|---|---|
+| Boundary detection | Fixed token window (450 tokens) | Embedding similarity drops |
+| Parent context | Yes (1200-token parent stored) | No parent (each chunk is self-contained) |
+| Chunk size range | 400-512 tokens (fixed) | 100-800 tokens (variable) |
+| Code block handling | May split mid-block | Keeps code blocks intact |
+| Use case | General-purpose indexing | Long-form Confluence runbooks, ICM incidents with variable sections |
+
+**When to use which:**
+- **Parent-Child:** Default for most content. Best when you need context expansion (child→parent) for short retrieved chunks.
+- **Semantic:** Best for Confluence runbooks with distinct sections (Root Cause → Diagnosis → Resolution → Prevention), ICM incidents with variable-length fields, and Kusto docs that interleave KQL code with prose.
+
+---
+
 ## 6. Index Sizing Estimates
 
 | Metric | Estimate |

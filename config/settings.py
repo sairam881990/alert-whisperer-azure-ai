@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Optional
+import time as _time
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -163,6 +164,19 @@ class LLMSettings(BaseSettings):
             "when building conversational prompts. Older messages are dropped first."
         ),
     )
+    # PE3: Minimum number of feedback samples before DSPy optimization is triggered.
+    dspy_min_optimization_samples: int = Field(
+        default=20,
+        description=(
+            "PE3: Minimum feedback samples required before DSPy optimizer updates a "
+            "prompt signature. Prevents premature optimization on sparse data."
+        ),
+    )
+    # PE5: Prompt template cache TTL in seconds.
+    prompt_cache_ttl_seconds: int = Field(
+        default=3600,
+        description="PE5: Prompt template cache TTL in seconds. Set to 0 to disable caching.",
+    )
 
 
 class TeamsSettings(BaseSettings):
@@ -261,6 +275,39 @@ class RoutingSettings(BaseSettings):
     )
 
 
+class ChatEngineSettings(BaseSettings):
+    """Chat engine session and routing configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="CHAT_")
+
+    response_cache_ttl_seconds: int = Field(default=300, description="TTL for response cache entries")
+    response_cache_max_size: int = Field(default=200, description="Maximum cached responses")
+    session_ttl_seconds: int = Field(default=3600, description="Session TTL in seconds")
+    max_sessions: int = Field(default=100, description="Maximum concurrent sessions")
+    min_routing_confidence: float = Field(default=0.3, description="Minimum confidence for intent routing")
+    context_window_size: int = Field(default=20, description="Number of recent messages to include in context")
+    cove_enabled: bool = Field(default=True, description="Enable Chain-of-Verification on responses")
+
+
+class AlertTriageSettings(BaseSettings):
+    """Alert triage engine configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="ALERT_TRIAGE_")
+
+    max_alert_history: int = Field(default=10000, description="Maximum alerts to keep in memory")
+    cascade_window_multiplier: float = Field(default=2.0, description="Multiplier on time window for cascade detection")
+    severity_decay_minutes: int = Field(default=60, description="Minutes before severity can decay")
+
+
+class DataRefreshSettings(BaseSettings):
+    """Data refresh engine configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="DATA_REFRESH_")
+
+    max_seen_alerts: int = Field(default=50000, description="Maximum seen-alert fingerprints to track")
+    parallel_polling: bool = Field(default=True, description="Poll MCP sources in parallel")
+
+
 class AppSettings(BaseSettings):
     """Root application settings composing all sub-configurations."""
 
@@ -286,8 +333,39 @@ class AppSettings(BaseSettings):
     rag: RAGSettings = Field(default_factory=RAGSettings)
     azure_search: AzureSearchSettings = Field(default_factory=AzureSearchSettings)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
+    chat_engine: ChatEngineSettings = Field(default_factory=ChatEngineSettings)
+    alert_triage: AlertTriageSettings = Field(default_factory=AlertTriageSettings)
+    data_refresh: DataRefreshSettings = Field(default_factory=DataRefreshSettings)
 
 
-def get_settings() -> AppSettings:
-    """Factory to create settings instance. Cached at module level."""
-    return AppSettings()
+# O7: Module-level cache for hot-reload support
+_settings_cache: Optional[AppSettings] = None
+_settings_mtime: float = 0.0
+
+
+def get_settings(force_reload: bool = False) -> AppSettings:
+    """O7: Factory with hot-reload support.
+
+    Returns a cached AppSettings instance. Checks the .env file mtime on
+    every call — if the file has changed since the last load, the settings
+    are reloaded automatically. Pass force_reload=True to always reload.
+    """
+    global _settings_cache, _settings_mtime
+
+    if force_reload or _settings_cache is None:
+        _settings_cache = AppSettings()
+        _settings_mtime = _time.time()
+        return _settings_cache
+
+    # Hot-reload: check if .env file has changed
+    import os
+    env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+    try:
+        current_mtime = os.path.getmtime(env_path)
+        if current_mtime > _settings_mtime:
+            _settings_cache = AppSettings()
+            _settings_mtime = current_mtime
+    except OSError:
+        pass  # .env not found or not readable — keep cached settings
+
+    return _settings_cache

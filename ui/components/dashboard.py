@@ -11,6 +11,21 @@ import streamlit as st
 from src.models import DashboardMetrics
 
 
+def _render_dedup_metrics(dedup_stats: dict) -> None:
+    """O6: Render alert deduplication effectiveness metrics.
+
+    Args:
+        dedup_stats: Dict with keys total_groups, total_alerts,
+                     dedup_ratio, and active_cascades.
+    """
+    st.markdown("### Alert Deduplication")
+    cols = st.columns(4)
+    cols[0].metric("Total Groups", dedup_stats.get("total_groups", 0))
+    cols[1].metric("Total Alerts", dedup_stats.get("total_alerts", 0))
+    cols[2].metric("Dedup Ratio", f"{dedup_stats.get('dedup_ratio', 0):.0%}")
+    cols[3].metric("Active Cascades", dedup_stats.get("active_cascades", 0))
+
+
 def render_dashboard(metrics: DashboardMetrics) -> None:
     """Render the main dashboard with metrics and visualizations."""
 

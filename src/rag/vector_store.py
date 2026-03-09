@@ -1706,6 +1706,37 @@ class VectorStore:
                 del self._inmemory_docs[k]
             return len(to_delete)
 
+    # O4: Staleness thresholds in days
+    STALENESS_THRESHOLDS: dict[str, int] = {
+        "fresh": 30,    # < 30 days
+        "aging": 90,    # 30–90 days
+        "stale": 180,   # 90–180 days
+        "expired": 365, # > 365 days
+    }
+
+    def get_staleness_label(self, last_modified: Optional["datetime"]) -> str:
+        """O4: Return a staleness label for a KB document based on its last_modified date.
+
+        Labels: 'fresh' (<30 days), 'aging' (30–90 days), 'stale' (90–180 days),
+        'expired' (>180 days), or 'unknown' if last_modified is None.
+        """
+        if last_modified is None:
+            return "unknown"
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        # Normalise naive datetimes to UTC
+        if last_modified.tzinfo is None:
+            last_modified = last_modified.replace(tzinfo=timezone.utc)
+        age_days = (now - last_modified).days
+        if age_days < self.STALENESS_THRESHOLDS["fresh"]:
+            return "fresh"
+        elif age_days < self.STALENESS_THRESHOLDS["aging"]:
+            return "aging"
+        elif age_days < self.STALENESS_THRESHOLDS["stale"]:
+            return "stale"
+        else:
+            return "expired"
+
     async def get_stats(self) -> dict[str, Any]:
         """Get vector store statistics."""
         total = self.document_count

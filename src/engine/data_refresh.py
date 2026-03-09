@@ -44,6 +44,7 @@ Why this design:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -196,6 +197,16 @@ class DataRefreshEngine:
             "ICM MCP": ConnectorStatus("ICM MCP"),
         }
 
+        # DR6: Delta dedup seen-set
+        self._seen_alert_hashes: set[str] = set()
+        self._max_seen_size: int = 50000
+
+        # DR8: Confluence re-index flag
+        self._force_confluence_reindex: bool = False
+
+        # O2: High-watermark timestamps per source for incremental refresh
+        self._high_watermarks: dict[str, datetime] = {}
+
     def register_connector(self, name: str, connector: Any) -> None:
         """Register a live MCP connector, replacing demo for that source."""
         if name in self.connectors:
@@ -288,6 +299,9 @@ class DataRefreshEngine:
                 status.last_error = str(e)
                 logger.error("connector_poll_failed", name=name, error=str(e))
 
+        # DR6: Delta dedup — filter already-seen alerts before ingestion
+        new_alerts = self._deduplicate_alerts(new_alerts)
+
         # Feed into triage engine
         if new_alerts:
             self.triage_engine.ingest_alerts(new_alerts)
@@ -301,6 +315,105 @@ class DataRefreshEngine:
             new_alerts=len(new_alerts),
             total_refreshes=self.total_refreshes,
         )
+        return new_alerts
+
+    # DR8: Confluence re-index trigger
+    def trigger_confluence_reindex(self) -> dict[str, Any]:
+        """DR8: Trigger a full Confluence KB re-index on the next refresh cycle."""
+        logger.info("confluence_reindex_triggered")
+        self._force_confluence_reindex = True
+        return {"status": "triggered", "message": "Confluence re-index will run on next refresh cycle"}
+
+    # DR5: Parallel MCP polling
+    async def _poll_all_sources_parallel(self) -> list[ParsedFailure]:
+        """DR5: Poll all connected MCP sources in parallel using asyncio.gather."""
+        tasks = []
+        task_names = []
+
+        for name, status in self.connectors.items():
+            if not status.connected or not status.connector:
+                continue
+            if name == "Confluence MCP":
+                continue  # Confluence doesn't produce alerts
+
+            since = status.last_poll_ts or (datetime.now(timezone.utc) - timedelta(hours=1))
+
+            if name == "Kusto MCP":
+                tasks.append(
+                    status.connector.get_ingestion_failures(
+                        since=since.isoformat(), limit=100
+                    )
+                )
+                task_names.append(name)
+            elif name == "Log Analytics MCP":
+                timespan_hours = max(1, int(
+                    (datetime.now(timezone.utc) - since).total_seconds() / 3600
+                ))
+                tasks.append(
+                    status.connector.query_failures(
+                        timespan_hours=timespan_hours,
+                        severity_filter="warning,error,critical",
+                    )
+                )
+                task_names.append(name)
+            elif name == "ICM MCP":
+                tasks.append(
+                    status.connector.get_active_incidents(since=since.isoformat())
+                )
+                task_names.append(name)
+
+        if not tasks:
+            return []
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        all_alerts: list[ParsedFailure] = []
+        for i, r in enumerate(results):
+            name = task_names[i]
+            if isinstance(r, Exception):
+                logger.error("poll_source_failed", name=name, error=str(r))
+            elif isinstance(r, list):
+                for item in r:
+                    if item is not None:
+                        all_alerts.append(self._parse_mcp_result(item, name))
+        return all_alerts
+
+    # ─── Internal helpers ─────────────────────────
+
+    def _get_or_create_event_loop(self) -> asyncio.AbstractEventLoop:
+        """DR1: Get existing event loop or create one safely."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("closed")
+            return loop
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+
+    def _deterministic_hash(self, data: str) -> str:
+        """DR3: Deterministic hash for dedup keys (hashlib, not built-in hash())."""
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+    def _alert_fingerprint(self, alert: ParsedFailure) -> str:
+        """DR6: Create a stable fingerprint for alert dedup."""
+        ts_str = alert.timestamp.isoformat() if alert.timestamp else "no-ts"
+        raw = f"{alert.pipeline_name}::{alert.error_class}::{ts_str}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def _deduplicate_alerts(self, alerts: list[ParsedFailure]) -> list[ParsedFailure]:
+        """DR6: Filter out already-seen alerts using the fingerprint seen-set."""
+        new_alerts = []
+        for a in alerts:
+            fp = self._alert_fingerprint(a)
+            if fp not in self._seen_alert_hashes:
+                self._seen_alert_hashes.add(fp)
+                new_alerts.append(a)
+        # Trim seen set if it grows too large (keep most-recently-added half)
+        if len(self._seen_alert_hashes) > self._max_seen_size:
+            excess = len(self._seen_alert_hashes) - self._max_seen_size // 2
+            for _ in range(excess):
+                self._seen_alert_hashes.pop()
         return new_alerts
 
     def _poll_connector(
@@ -318,7 +431,8 @@ class DataRefreshEngine:
         )
 
         try:
-            loop = asyncio.new_event_loop()
+            # DR1: Use safe event loop acquisition
+            loop = self._get_or_create_event_loop()
 
             if name == "Kusto MCP":
                 # Query Kusto for ingestion failures
@@ -351,13 +465,9 @@ class DataRefreshEngine:
                 )
             elif name == "Confluence MCP":
                 # Confluence doesn't produce alerts — skip polling
-                loop.close()
                 return []
             else:
-                loop.close()
                 return []
-
-            loop.close()
 
             # Parse results into ParsedFailure objects
             if isinstance(result, list):
@@ -385,8 +495,17 @@ class DataRefreshEngine:
             return item
 
         if isinstance(item, dict):
+            # DR4: Determine data_source_tag based on connector name
+            _source_map = {
+                "Kusto MCP": "live_mcp",
+                "Log Analytics MCP": "live_mcp",
+                "ICM MCP": "live_mcp",
+                "Confluence MCP": "live_mcp",
+            }
+            _data_source = _source_map.get(source_name, "demo")
             return ParsedFailure(
-                failure_id=item.get("id", f"mcp-{hash(str(item)) & 0xFFFFFF:06x}"),
+                # DR3: Deterministic hash for stable failure_id across process restarts
+                failure_id=item.get("id", f"mcp-{self._deterministic_hash(str(item))}"),
                 pipeline_name=item.get("pipeline_name", item.get("name", "unknown")),
                 pipeline_type=PipelineType(
                     item.get("pipeline_type", "spark_batch")
@@ -403,6 +522,8 @@ class DataRefreshEngine:
                 root_cause_summary=item.get("root_cause", ""),
                 affected_components=item.get("affected_components", []),
                 log_snippet=item.get("log_snippet", ""),
+                # DR4: Tag the data source so consumers can label responses
+                metadata={**item.get("metadata", {}), "data_source": _data_source},
             )
 
         # Fallback: can't parse
@@ -447,6 +568,35 @@ class DataRefreshEngine:
         if self.mode == DataSourceMode.LIVE:
             return "_Data source: Live_"
         return "_Data source: Mixed (some MCP connected)_"
+
+    def _get_watermark(self, source: str) -> Optional[datetime]:
+        """O2: Get the high-watermark timestamp for a data source.
+
+        Returns the most recent alert timestamp seen for *source*, or
+        None if no alerts have been ingested from that source yet.
+        """
+        return self._high_watermarks.get(source)
+
+    def _update_watermark(self, source: str, alerts: list["ParsedFailure"]) -> None:
+        """O2: Update the high-watermark for a source to the latest alert timestamp.
+
+        Only advances the watermark (never goes backwards). Call this after
+        successfully ingesting a batch of alerts from *source*.
+        """
+        if not alerts:
+            return
+        timestamps = [a.timestamp for a in alerts if a.timestamp is not None]
+        if not timestamps:
+            return
+        latest = max(timestamps)
+        current = self._high_watermarks.get(source)
+        if current is None or latest > current:
+            self._high_watermarks[source] = latest
+            logger.info(
+                "watermark_updated",
+                source=source,
+                timestamp=latest.isoformat(),
+            )
 
     def get_refresh_stats(self) -> dict[str, Any]:
         """Get stats for the settings/dashboard page."""

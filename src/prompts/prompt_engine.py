@@ -22,6 +22,8 @@ import asyncio
 import json
 import re
 import hashlib
+import random
+import time
 from typing import Any, Callable, Optional
 
 import structlog
@@ -282,6 +284,10 @@ class DSPyPromptOptimizer:
     prompt construction with metric-driven selection.
     """
 
+    # PE3: Configurable minimum samples before DSPy optimization runs.
+    # Class constant — override at instance level if needed.
+    DSPY_MIN_SAMPLES: int = 20
+
     def __init__(self, default_temperature: float = 0.1):
         # P8: Single configurable temperature default — eliminates 0.1/0.2/0.3 inconsistencies.
         # All DSPy signatures use this value unless explicitly overridden at call time.
@@ -399,7 +405,7 @@ class DSPyPromptOptimizer:
         self._metrics[key].append(score)
 
         # If enough data, update default signature
-        if len(self._metrics[key]) >= 5:
+        if len(self._metrics[key]) >= self.DSPY_MIN_SAMPLES:
             avg = sum(self._metrics[key][-10:]) / len(self._metrics[key][-10:])
             current = self._default_signatures.get(error_class, {})
             if not current or avg > 0.8:
@@ -449,6 +455,15 @@ class PromptEngine:
     - Chain-of-Verification for factual safety
     """
 
+    # PE2: LLM retry configuration constants
+    MAX_LLM_RETRIES: int = 3
+    LLM_RETRY_BASE_SECONDS: float = 1.0
+    LLM_RETRY_MAX_SECONDS: float = 10.0
+
+    # O1: Stack trace truncation constants
+    MAX_STACK_TRACE_LINES: int = 30
+    STACK_TRACE_CONTEXT_LINES: int = 5
+
     def __init__(
         self,
         llm_client: Any = None,
@@ -457,6 +472,7 @@ class PromptEngine:
         llm_timeout: float = 30.0,
         tool_registry: Optional["ToolRegistry"] = None,
         conversation_token_budget: int = 8000,
+        prompt_cache_ttl_seconds: Optional[int] = None,
     ):
         self.llm_client = llm_client
         self.max_context_tokens = max_context_tokens
@@ -469,6 +485,18 @@ class PromptEngine:
         self.conversation_token_budget = conversation_token_budget
         # P8: DSPy optimizer shares the same temperature default as PromptEngine
         self.dspy_optimizer = DSPyPromptOptimizer(default_temperature=default_temperature)
+        # PE5: Configurable prompt cache TTL; reads from settings.llm if not provided
+        if prompt_cache_ttl_seconds is not None:
+            self._prompt_cache_ttl = prompt_cache_ttl_seconds
+        else:
+            try:
+                from config.settings import get_settings as _get_settings
+                _s = _get_settings()
+                self._prompt_cache_ttl = getattr(
+                    getattr(_s, 'llm', _s), 'prompt_cache_ttl_seconds', 3600
+                )
+            except Exception:
+                self._prompt_cache_ttl = 3600
 
     def build_system_prompt(
         self,
@@ -1051,3 +1079,97 @@ class PromptEngine:
             items = re.split(r'[,\n•\-]', raw)
             return [item.strip() for item in items if item.strip()]
         return []
+
+    def _parse_llm_output_safe(self, raw_output: str, expected_fields: list[str]) -> dict[str, str]:
+        """PE1: Parse LLM output with graceful fallback.
+
+        Tries multiple regex patterns to extract structured fields. If all
+        fields come back empty, treats the entire output as the first field.
+        """
+        result: dict[str, str] = {}
+        for field in expected_fields:
+            patterns = [
+                rf'\*\*{field}\*\*[:\s]+(.+?)(?=\n\*\*|\n\n|$)',
+                rf'{field}[:\s]+(.+?)(?=\n[A-Z]|\n\n|$)',
+                rf'#{1,3}\s*{field}\s*\n(.+?)(?=\n#|\n\n|$)',
+            ]
+            for pat in patterns:
+                match = re.search(pat, raw_output, re.IGNORECASE | re.DOTALL)
+                if match:
+                    result[field] = match.group(1).strip()
+                    break
+            if field not in result:
+                result[field] = ""
+
+        # If all fields empty, treat entire output as the first field
+        if all(v == "" for v in result.values()) and expected_fields:
+            result[expected_fields[0]] = raw_output.strip()
+            logger.warning("parse_fallback_used", raw_length=len(raw_output))
+
+        return result
+
+    async def _call_llm_with_retry(self, prompt: str, temperature: float = 0.1,
+                                    max_tokens: int = 4096, **kwargs: Any) -> str:
+        """PE2: Call LLM with exponential backoff retry.
+
+        Wraps the underlying invoke_llm call (single-message) with up to
+        MAX_LLM_RETRIES attempts, using jittered exponential backoff.
+        """
+        messages = [{"role": "user", "content": prompt}]
+        last_error: Optional[Exception] = None
+        for attempt in range(self.MAX_LLM_RETRIES):
+            try:
+                return await self.invoke_llm(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **kwargs,
+                )
+            except Exception as e:
+                last_error = e
+                if attempt < self.MAX_LLM_RETRIES - 1:
+                    delay = min(
+                        self.LLM_RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0, 1),
+                        self.LLM_RETRY_MAX_SECONDS,
+                    )
+                    logger.warning(
+                        "llm_retry",
+                        attempt=attempt + 1,
+                        delay=round(delay, 2),
+                        error=str(e),
+                    )
+                    if asyncio.get_event_loop().is_running():
+                        await asyncio.sleep(delay)
+                    else:
+                        time.sleep(delay)
+
+        logger.error(
+            "llm_retries_exhausted",
+            attempts=self.MAX_LLM_RETRIES,
+            error=str(last_error),
+        )
+        raise last_error  # type: ignore[misc]
+
+    def _truncate_stack_trace(self, log_snippet: str) -> str:
+        """O1: Truncate long stack traces keeping the most relevant parts.
+
+        Retains the first and last STACK_TRACE_CONTEXT_LINES lines plus any
+        'Caused by' lines, which are the most diagnostic.
+        """
+        lines = log_snippet.split('\n')
+        if len(lines) <= self.MAX_STACK_TRACE_LINES:
+            return log_snippet
+
+        head = lines[:self.STACK_TRACE_CONTEXT_LINES]
+        tail = lines[-self.STACK_TRACE_CONTEXT_LINES:]
+
+        # Extract 'Caused by' lines — most informative
+        caused_by = [l for l in lines if 'Caused by' in l or 'caused by' in l.lower()]
+
+        omitted = len(lines) - 2 * self.STACK_TRACE_CONTEXT_LINES
+        truncated = head + [f"... ({omitted} lines omitted) ..."]
+        if caused_by:
+            truncated.extend(caused_by[:3])
+        truncated.extend(tail)
+
+        return '\n'.join(truncated)

@@ -163,9 +163,12 @@ class AlertDeduplicator:
         self,
         time_window_minutes: int = 30,
         similarity_threshold: float = 0.7,
+        cascade_window_multiplier: float = 2.0,
     ):
         self.time_window = timedelta(minutes=time_window_minutes)
         self.similarity_threshold = similarity_threshold
+        # AT5: Configurable cascade window multiplier
+        self.cascade_window_multiplier: float = cascade_window_multiplier
         self._dedup_groups: dict[str, AlertGroup] = {}
         self._cascade_clusters: list[CascadeCluster] = []
         self._alert_index: dict[str, ParsedFailure] = {}  # failure_id -> alert
@@ -236,7 +239,8 @@ class AlertDeduplicator:
 
         # Check recent alerts for downstream effects
         now = datetime.now(timezone.utc)
-        window = self.time_window * 2  # Wider window for cascades
+        # AT5: Use configurable cascade window multiplier
+        window = self.time_window * self.cascade_window_multiplier  # Wider window for cascades
 
         for other_alert in self._alert_index.values():
             if other_alert.failure_id == alert.failure_id:

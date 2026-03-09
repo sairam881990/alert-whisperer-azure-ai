@@ -94,6 +94,11 @@ class TriagedCluster:
         self.first_seen: datetime = primary_alert.timestamp
         self.last_updated: datetime = primary_alert.timestamp
 
+        # AT10: Acknowledgment tracking
+        self.acknowledged: bool = False
+        self.acknowledged_by: Optional[str] = None
+        self.acknowledged_at: Optional[datetime] = None
+
     def add_alert(self, alert: ParsedFailure) -> None:
         """Add an alert to this triaged cluster."""
         self.all_alerts.append(alert)
@@ -189,6 +194,9 @@ class AlertTriageEngine:
     5. Surface top critical clusters proactively
     """
 
+    # AT1: Maximum alerts to retain in the rolling window
+    MAX_ALERT_HISTORY: int = 10000
+
     def __init__(
         self,
         deduplicator: AlertDeduplicator,
@@ -202,6 +210,14 @@ class AlertTriageEngine:
         self._all_alerts: list[ParsedFailure] = []
         self._pipeline_health: dict[str, dict[str, Any]] = {}
 
+        # AT2: Indexes for fast lookup
+        self._pipeline_index: dict[str, list[ParsedFailure]] = defaultdict(list)
+        self._error_class_index: dict[str, list[ParsedFailure]] = defaultdict(list)
+        self._severity_index: dict[Severity, list[ParsedFailure]] = defaultdict(list)
+
+        # AT7: Suppression rules
+        self._suppression_rules: list[dict[str, str]] = []
+
     def ingest_alert(self, alert: ParsedFailure) -> TriagedCluster:
         """
         Ingest a single alert through the triage pipeline.
@@ -211,7 +227,19 @@ class AlertTriageEngine:
         3. Score and rank
         4. Update pipeline health state
         """
+        # AT7: Check suppression before processing
+        if self._is_suppressed(alert):
+            # Return a lightweight cluster for the suppressed alert without full triage
+            dedup_key = f"suppressed-{alert.failure_id}"
+            cluster = TriagedCluster(cluster_id=dedup_key, primary_alert=alert)
+            return cluster
+
         self._all_alerts.append(alert)
+
+        # AT2: Update indexes
+        self._pipeline_index[alert.pipeline_name].append(alert)
+        self._error_class_index[alert.error_class].append(alert)
+        self._severity_index[alert.severity].append(alert)
 
         # Step 1: Deduplicate and detect cascades
         group = self.deduplicator.process_alert(alert)
@@ -257,6 +285,10 @@ class AlertTriageEngine:
             severity=cluster.composite_severity.value,
             is_cascade=cluster.is_cascade,
         )
+
+        # AT1: Enforce rolling window
+        self._enforce_alert_window()
+
         return cluster
 
     def ingest_alerts(self, alerts: list[ParsedFailure]) -> list[TriagedCluster]:
@@ -328,12 +360,11 @@ class AlertTriageEngine:
     def get_alerts_by_severity(
         self, severity: Severity, hours_back: int = 24
     ) -> list[ParsedFailure]:
-        """Get all alerts at a specific severity level."""
+        """Get all alerts at a specific severity level (AT2: uses severity index)."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
         results = []
-        for a in self._all_alerts:
-            if a.severity != severity:
-                continue
+        # AT2: Use severity index for O(severity_bucket) lookup instead of O(all_alerts)
+        for a in self._severity_index.get(severity, []):
             ts = a.timestamp
             if ts is None:
                 continue
@@ -346,20 +377,22 @@ class AlertTriageEngine:
     def get_alerts_by_pipeline(
         self, pipeline_name: str, hours_back: int = 24
     ) -> list[ParsedFailure]:
-        """Get all alerts for a specific pipeline."""
+        """Get all alerts for a specific pipeline (AT2: uses pipeline index)."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
         name_lower = pipeline_name.lower()
         results = []
-        for a in self._all_alerts:
-            if name_lower not in a.pipeline_name.lower():
+        # AT2: Use pipeline index for O(pipeline_bucket) lookup; also handle partial match
+        for index_key, alerts in self._pipeline_index.items():
+            if name_lower not in index_key.lower():
                 continue
-            ts = a.timestamp
-            if ts is None:
-                continue
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if ts >= cutoff:
-                results.append(a)
+            for a in alerts:
+                ts = a.timestamp
+                if ts is None:
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts >= cutoff:
+                    results.append(a)
         return results
 
     def get_pipeline_health(self, pipeline_name: Optional[str] = None) -> dict[str, Any]:
@@ -564,7 +597,8 @@ class AlertTriageEngine:
             }
         health = self._pipeline_health[name]
         health["last_alert"] = alert.timestamp
-        health["alert_count_24h"] = health.get("alert_count_24h", 0) + 1
+        # AT3: Use time-windowed 24h count instead of increment-only counter
+        health["alert_count_24h"] = self._compute_24h_count(name)
         health["latest_error"] = alert.error_class
         health["alerts"] = health.get("alerts", [])
         health["alerts"].append(alert)
@@ -578,3 +612,125 @@ class AlertTriageEngine:
             health["status"] = "elevated"
         else:
             health["status"] = "warning"
+
+    # AT1: Rolling window enforcement
+    def _enforce_alert_window(self) -> None:
+        """Trim _all_alerts to MAX_ALERT_HISTORY, keeping most recent."""
+        if len(self._all_alerts) > self.MAX_ALERT_HISTORY:
+            excess = len(self._all_alerts) - self.MAX_ALERT_HISTORY
+            self._all_alerts = self._all_alerts[excess:]
+            logger.info("alert_window_trimmed", removed=excess, remaining=self.MAX_ALERT_HISTORY)
+
+    # AT3: Time-windowed 24h count using pipeline index
+    def _compute_24h_count(self, pipeline_name: str) -> int:
+        """Count alerts for pipeline in the last 24 hours."""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        alerts = self._pipeline_index.get(pipeline_name, [])
+        return sum(
+            1 for a in alerts
+            if a.timestamp and
+            (a.timestamp if a.timestamp.tzinfo else a.timestamp.replace(tzinfo=timezone.utc)) >= cutoff
+        )
+
+    # AT7: Alert suppression
+    def add_suppression_rule(
+        self, pipeline_pattern: str = "", error_pattern: str = "", reason: str = ""
+    ) -> None:
+        """Add a suppression rule. Matching alerts are logged but not triaged."""
+        self._suppression_rules.append({
+            "pipeline": pipeline_pattern.lower(),
+            "error": error_pattern.lower(),
+            "reason": reason,
+        })
+
+    def _is_suppressed(self, alert: ParsedFailure) -> bool:
+        """Check if alert matches any suppression rule."""
+        for rule in self._suppression_rules:
+            if rule["pipeline"] and rule["pipeline"] not in alert.pipeline_name.lower():
+                continue
+            if rule["error"] and rule["error"] not in alert.error_class.lower():
+                continue
+            if rule["pipeline"] or rule["error"]:  # At least one pattern matched
+                logger.info(
+                    "alert_suppressed",
+                    pipeline=alert.pipeline_name,
+                    error=alert.error_class,
+                    reason=rule["reason"],
+                )
+                return True
+        return False
+
+    # AT9: Severity time-decay
+    def _decay_cluster_severity(self, cluster: TriagedCluster) -> None:
+        """Decay severity if no new high-sev alerts in the decay window."""
+        DECAY_MINUTES = 60  # After 60 min with no new high-sev, consider downgrade
+        now = datetime.now(timezone.utc)
+        recent_high = any(
+            a.severity in (Severity.CRITICAL, Severity.HIGH)
+            and (
+                now - (
+                    a.timestamp if a.timestamp.tzinfo
+                    else a.timestamp.replace(tzinfo=timezone.utc)
+                )
+            ).total_seconds() < DECAY_MINUTES * 60
+            for a in cluster.all_alerts
+        )
+        if not recent_high and cluster.composite_severity in (Severity.CRITICAL, Severity.HIGH):
+            DOWNGRADE = {Severity.CRITICAL: Severity.HIGH, Severity.HIGH: Severity.MEDIUM}
+            new_sev = DOWNGRADE.get(cluster.composite_severity, cluster.composite_severity)
+            logger.info(
+                "severity_decayed",
+                cluster=cluster.cluster_id,
+                old=cluster.composite_severity.value,
+                new=new_sev.value,
+            )
+            cluster.composite_severity = new_sev
+
+    # AT10: Cluster acknowledgment
+    def acknowledge_cluster(self, cluster_id: str, user: str = "operator") -> bool:
+        """Mark a cluster as acknowledged."""
+        if cluster_id in self._triaged_clusters:
+            cluster = self._triaged_clusters[cluster_id]
+            cluster.acknowledged = True
+            cluster.acknowledged_by = user
+            cluster.acknowledged_at = datetime.now(timezone.utc)
+            logger.info("cluster_acknowledged", cluster_id=cluster_id, user=user)
+            return True
+        return False
+
+    def get_unacknowledged_clusters(self) -> list[TriagedCluster]:
+        """Get all clusters that haven't been acknowledged."""
+        return [c for c in self._triaged_clusters.values() if not c.acknowledged]
+
+    def correlate_icm_tickets(self, tickets: list) -> dict[str, list]:
+        """O5: Correlate ICM tickets to alert clusters by pipeline name and error class.
+
+        Matches tickets to clusters using two strategies:
+        1. Pipeline name match: ticket.related_pipeline ⊆ cluster.primary_alert.pipeline_name
+        2. Error class keyword match: cluster.primary_alert.error_class in ticket.title
+
+        Returns:
+            Dict mapping cluster_id -> list of matching ICM tickets.
+        """
+        correlations: dict[str, list] = {}
+        for cluster in self._triaged_clusters.values():
+            cluster_matches = []
+            for ticket in tickets:
+                # Strategy 1: match by related pipeline name
+                if hasattr(ticket, 'related_pipeline') and ticket.related_pipeline:
+                    if ticket.related_pipeline.lower() in cluster.primary_alert.pipeline_name.lower():
+                        cluster_matches.append(ticket)
+                        continue
+                # Strategy 2: match by error class keyword in ticket title
+                if hasattr(ticket, 'title') and ticket.title:
+                    if cluster.primary_alert.error_class.lower() in ticket.title.lower():
+                        cluster_matches.append(ticket)
+            if cluster_matches:
+                correlations[cluster.cluster_id] = cluster_matches
+        logger.info(
+            "icm_correlation_complete",
+            clusters_checked=len(self._triaged_clusters),
+            clusters_matched=len(correlations),
+            tickets_total=len(tickets),
+        )
+        return correlations

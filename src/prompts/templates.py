@@ -128,6 +128,8 @@ Supporting Azure Infrastructure:
 7. When recommending Spark configuration changes, validate values against known valid ranges
 8. When diagnosing Kusto errors, note whether the prefix is Permanent_ (no retry) or Transient_ (auto-retry)
 9. When diagnosing Synapse errors, identify whether the IR type is relevant to the failure
+
+IMPORTANT: If you are uncertain about an answer or the available data is insufficient to provide an accurate response, clearly state "I don't have enough information to answer this accurately" rather than guessing. It's better to be honest about limitations than to provide potentially incorrect information.
 """
 
 STYLE_GUIDE_PROMPT = """=== COMMUNICATION STYLE ===
@@ -140,6 +142,8 @@ STYLE_GUIDE_PROMPT = """=== COMMUNICATION STYLE ===
 - Use consistent terminology: 'pipeline' not 'job/flow/workflow' interchangeably
 - Timestamp all references (UTC)
 - Bold critical information: severity, affected pipeline, required action
+
+IMPORTANT: If you are uncertain about an answer or the available data is insufficient to provide an accurate response, clearly state "I don't have enough information to answer this accurately" rather than guessing. It's better to be honest about limitations than to provide potentially incorrect information.
 """
 
 SOLUTION_PROMPT = """=== SOLUTION FRAMEWORK ===
@@ -163,6 +167,8 @@ When providing solutions, follow this structure:
 - Monitoring/alerting improvements
 - Runbook updates needed
 - Architectural changes to prevent recurrence
+
+IMPORTANT: If you are uncertain about an answer or the available data is insufficient to provide an accurate response, clearly state "I don't have enough information to answer this accurately" rather than guessing. It's better to be honest about limitations than to provide potentially incorrect information.
 """
 
 

@@ -20,10 +20,12 @@ Enhanced with alert-free modes:
 
 from __future__ import annotations
 
+import hashlib
 import re
+import time
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, AsyncGenerator, AsyncIterator, Optional
 
 import structlog
 
@@ -385,6 +387,43 @@ class EmbeddingIntentClassifier:
 
 
 # ─────────────────────────────────────────────────
+# Response Cache
+# ─────────────────────────────────────────────────
+
+class ResponseCache:
+    """LRU-style response cache with TTL expiration."""
+
+    def __init__(self, max_size: int = 200, ttl_seconds: int = 300):
+        self._cache: dict[str, tuple[str, float]] = {}
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+
+    def _make_key(self, query: str, intent: str, context_hash: str) -> str:
+        raw = f"{query.lower().strip()}::{intent}::{context_hash}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def get(self, query: str, intent: str, context_hash: str = "") -> Optional[str]:
+        key = self._make_key(query, intent, context_hash)
+        if key in self._cache:
+            val, ts = self._cache[key]
+            if time.time() - ts < self._ttl:
+                return val
+            del self._cache[key]
+        return None
+
+    def put(self, query: str, intent: str, response: str, context_hash: str = "") -> None:
+        if len(self._cache) >= self._max_size:
+            # Evict oldest
+            oldest_key = min(self._cache, key=lambda k: self._cache[k][1])
+            del self._cache[oldest_key]
+        key = self._make_key(query, intent, context_hash)
+        self._cache[key] = (response, time.time())
+
+    def invalidate(self) -> None:
+        self._cache.clear()
+
+
+# ─────────────────────────────────────────────────
 # Chat Engine (Enhanced)
 # ─────────────────────────────────────────────────
 
@@ -404,6 +443,91 @@ class ChatEngine:
     - Alert-free modes: discovery, health checks, search, analytics
     """
 
+    # ── CE2: Regex-based uncertainty detection patterns ────────────────────
+    UNCERTAINTY_PATTERNS = [
+        re.compile(r'\bI think\b', re.IGNORECASE),
+        re.compile(r'\bmaybe\b', re.IGNORECASE),
+        re.compile(r'\bpossibly\b', re.IGNORECASE),
+        re.compile(r'\bnot sure\b', re.IGNORECASE),
+        re.compile(r'\bmight be\b', re.IGNORECASE),
+        re.compile(r'\bcould be\b', re.IGNORECASE),
+        re.compile(r'\bprobably\b', re.IGNORECASE),
+        re.compile(r'\buncertain\b', re.IGNORECASE),
+        re.compile(r'\bapproximately\b', re.IGNORECASE),
+    ]
+
+    # ── CE3: Per-intent temperature map ───────────────────────────────────
+    INTENT_TEMPERATURE_MAP: dict[str, float] = {
+        "ROOT_CAUSE": 0.05,
+        "TROUBLESHOOT": 0.05,
+        "PIPELINE_DETAIL": 0.1,
+        "ALERT_SEARCH": 0.1,
+        "RUNBOOK": 0.1,
+        "ESCALATION": 0.1,
+        "HEALTH_CHECK": 0.15,
+        "CROSS_ALERT_ANALYTICS": 0.15,
+        "GENERAL": 0.3,
+    }
+
+    # ── CE7: Session TTL management ────────────────────────────────────────
+    SESSION_TTL_SECONDS: int = 3600  # 1 hour
+    MAX_SESSIONS: int = 100
+
+    # ── CE8: Minimum routing confidence threshold ──────────────────────────
+    MIN_ROUTING_CONFIDENCE: float = 0.3
+
+    # ── CE11: Configurable context window size ─────────────────────────────
+    CONTEXT_WINDOW_SIZE: int = 20
+
+    # ── CE16: Stale runbook detection ──────────────────────────────────────
+    RUNBOOK_STALENESS_DAYS: int = 90
+
+    # ── CE17: Special command handling ────────────────────────────────────
+    COMMANDS = {"/new", "/reset", "/clear"}
+
+    # ── CE22: Proactive follow-up suggestions map ──────────────────────────
+    FOLLOW_UP_MAP: dict[str, list[str]] = {
+        "ROOT_CAUSE": [
+            "What are the recommended fix steps?",
+            "Show me the runbook",
+            "Are there similar past incidents?",
+        ],
+        "TROUBLESHOOT": [
+            "Can you escalate this?",
+            "What's the blast radius?",
+            "Show related alerts",
+        ],
+        "HEALTH_CHECK": [
+            "Show me critical alerts",
+            "What failed recently?",
+            "Compare with yesterday",
+        ],
+        "ALERT_SEARCH": [
+            "Show me details for the top result",
+            "What's the root cause?",
+            "Any patterns across these?",
+        ],
+        "RUNBOOK": [
+            "Is this runbook up to date?",
+            "Show me similar incidents",
+            "What's the current status?",
+        ],
+    }
+
+    # ── CE1: CoVE-enabled intents ──────────────────────────────────────────
+    cove_enabled_intents: set = {
+        UserIntent.ROOT_CAUSE_DETAIL,
+        UserIntent.RUNBOOK_LOOKUP,
+        UserIntent.SIMILAR_INCIDENTS,
+        UserIntent.ESCALATION,
+        UserIntent.TREND_ANALYSIS,
+        UserIntent.BLAST_RADIUS,
+        UserIntent.ALERT_DISCOVERY,
+        UserIntent.PLATFORM_HEALTH,
+        UserIntent.ALERT_SEARCH,
+        UserIntent.CROSS_ALERT_ANALYTICS,
+    }
+
     def __init__(
         self,
         prompt_engine: PromptEngine,
@@ -418,6 +542,8 @@ class ChatEngine:
         self.intent_classifier = intent_classifier
         self.triage_engine = triage_engine
         self._sessions: dict[str, ConversationContext] = {}
+        # CE4: Response cache with TTL
+        self._response_cache = ResponseCache(max_size=200, ttl_seconds=300)
 
     def create_session(
         self,
@@ -474,17 +600,36 @@ class ChatEngine:
 
         Alert-free intents route to handlers that work WITHOUT active_alert.
         """
+        # CE7: Cleanup stale sessions at the start of each message
+        self._cleanup_stale_sessions()
+
         session = self._sessions.get(session_id)
         if not session:
             return "Session not found. Please start a new conversation."
 
-        session.add_message(MessageRole.USER, user_message)
+        # CE17: Handle special commands before anything else
+        command_response = self._handle_commands(user_message, session_id)
+        if command_response is not None:
+            return command_response
 
-        if self.intent_classifier:
-            intent = self.intent_classifier.classify(user_message)
+        session.add_message(MessageRole.USER, user_message)
+        # CE7: Track last active time
+        if not hasattr(session, "_last_active"):
+            object.__setattr__(session, "_last_active", time.time()) if hasattr(session, "__slots__") else setattr(session, "_last_active", time.time())
         else:
-            intent = classify_intent(user_message)
-        logger.info("intent_classified", session_id=session_id, intent=intent)
+            try:
+                session._last_active = time.time()  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+
+        # CE24: Use shared routing method
+        intent, confidence = self._route_intent(user_message, session)
+        logger.info("intent_classified", session_id=session_id, intent=intent, confidence=round(confidence, 3))
+
+        # CE6: Detect multi-intent and handle the primary one
+        sub_queries = self._detect_multi_intent(user_message)
+        if len(sub_queries) > 1:
+            logger.info("multi_intent_detected", count=len(sub_queries))
 
         # Route to handler — alert-free intents first
         if intent == UserIntent.ALERT_DISCOVERY:
@@ -531,12 +676,8 @@ class ChatEngine:
                     segments, existing_context=response
                 )
                 if flare_result and flare_result.chunks:
-                    additional_context = await self.rag_retriever.build_context_string(flare_result.chunks)
-                    response += (
-                        "\n\n---\n"
-                        "**Additional Context** (retrieved via active follow-up):\n"
-                        f"{additional_context[:1000]}"
-                    )
+                    # CE21: Deduplicate FLARE-retrieved context
+                    response = self._deduplicate_flare_context(response, flare_result.chunks)
                     logger.info(
                         "flare_augmented_response",
                         segments_detected=len(segments),
@@ -549,6 +690,12 @@ class ChatEngine:
                     segments=len(segments),
                     uncertainty_ratio=round(uncertainty_ratio, 3),
                 )
+
+        # CE1: Apply CoVE verification for configured intents
+        response = await self._maybe_apply_cove(response, intent, session)
+
+        # CE22: Append proactive follow-up suggestions
+        response += self._generate_follow_ups(intent)
 
         session.add_message(MessageRole.ASSISTANT, response)
         return response
@@ -570,19 +717,29 @@ class ChatEngine:
         - Streaming shows progressive investigation steps, building confidence
         - Mid-stream retrieval results appear as they become available
         """
+        # CE7: Cleanup stale sessions
+        self._cleanup_stale_sessions()
+
         session = self._sessions.get(session_id)
         if not session:
             yield "Session not found. Please start a new conversation."
             return
 
+        # CE17: Handle special commands
+        command_response = self._handle_commands(user_message, session_id)
+        if command_response is not None:
+            yield command_response
+            return
+
         session.add_message(MessageRole.USER, user_message)
+        try:
+            session._last_active = time.time()  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
 
-        if self.intent_classifier:
-            intent = self.intent_classifier.classify(user_message)
-        else:
-            intent = classify_intent(user_message)
-
-        logger.info("streaming_intent_classified", session_id=session_id, intent=intent)
+        # CE24: Use shared routing method
+        intent, confidence = self._route_intent(user_message, session)
+        logger.info("streaming_intent_classified", session_id=session_id, intent=intent, confidence=round(confidence, 3))
 
         # Generate initial response — alert-free intents first
         if intent == UserIntent.ALERT_DISCOVERY:
@@ -612,6 +769,14 @@ class ChatEngine:
         else:
             response = await self._handle_general_qa(session, user_message)
 
+        # CE1: Apply CoVE for configured intents
+        response = await self._maybe_apply_cove(response, intent, session)
+
+        # CE22: Append follow-up suggestions
+        follow_ups = self._generate_follow_ups(intent)
+        if follow_ups:
+            response += follow_ups
+
         # Yield initial response
         yield response
 
@@ -627,16 +792,12 @@ class ChatEngine:
                     segments, existing_context=response
                 )
                 if flare_result and flare_result.chunks:
-                    additional_context = await self.rag_retriever.build_context_string(
-                        flare_result.chunks
-                    )
-                    flare_supplement = (
-                        "\n\n---\n"
-                        "**Additional Context** (retrieved via active follow-up):\n"
-                        f"{additional_context[:1000]}"
-                    )
-                    response += flare_supplement
-                    yield flare_supplement
+                    # CE21: Deduplicate FLARE context
+                    new_response = self._deduplicate_flare_context(response, flare_result.chunks)
+                    flare_supplement = new_response[len(response):]
+                    response = new_response
+                    if flare_supplement:
+                        yield flare_supplement
                     logger.info(
                         "flare_streaming_augmented",
                         segments=len(segments),
@@ -901,6 +1062,8 @@ class ChatEngine:
         similar = await self.rag_retriever.find_similar_incidents(
             session.active_alert, days_back=days
         )
+        # CE15: Self-RAG relevance pass on similar incidents
+        similar = self._verify_similar_incidents(similar, message)
         session.similar_incidents = similar
 
         if not similar:
@@ -928,10 +1091,24 @@ class ChatEngine:
             response = f"**Runbook Steps:**\n\n{session.runbook_context}"
             if session.active_alert and session.active_alert.runbook_url:
                 response += f"\n\n[Open full runbook]({session.active_alert.runbook_url})"
+            # CE16: Check runbook staleness
+            if session.active_alert and hasattr(session.active_alert, "runbook_metadata"):
+                staleness_warning = self._check_runbook_staleness(
+                    session.active_alert.runbook_metadata or {}
+                )
+                if staleness_warning:
+                    response += f"\n\n{staleness_warning}"
         elif session.active_alert:
             steps = await self.alert_processor._fetch_runbook_steps(session.active_alert)
             session.runbook_context = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
             response = f"**Runbook Steps:**\n\n{session.runbook_context}"
+            # CE16: Check runbook staleness when fetching fresh
+            if hasattr(session.active_alert, "runbook_metadata"):
+                staleness_warning = self._check_runbook_staleness(
+                    session.active_alert.runbook_metadata or {}
+                )
+                if staleness_warning:
+                    response += f"\n\n{staleness_warning}"
         else:
             # Use Agentic RAG to search Confluence specifically
             result = await self.rag_retriever.retrieve_for_query(
@@ -1020,13 +1197,17 @@ class ChatEngine:
     def _handle_rerun_request(self, session: ConversationContext) -> str:
         """Handle pipeline rerun requests."""
         if session.active_alert and session.active_alert.rerun_url:
-            return (
+            base = (
                 f"**Rerun Pipeline:** {session.active_alert.pipeline_name}\n\n"
-                f"[Click here to rerun]({session.active_alert.rerun_url})\n\n"
                 f"Before rerunning, verify:\n"
                 f"1. The root cause has been addressed\n"
                 f"2. Upstream data sources are healthy\n"
                 f"3. Cluster resources are available"
+            )
+            # CE19: Wrap in confirmation-formatted rerun action
+            return base + self._format_rerun_action(
+                session.active_alert.rerun_url,
+                session.active_alert.pipeline_name,
             )
         elif session.active_alert:
             return (
@@ -1199,9 +1380,8 @@ class ChatEngine:
         )
         response = await self.prompt_engine.invoke_llm(messages)
 
-        # Active prompting: Check for uncertainty markers
-        uncertainty_markers = ["i'm not sure", "might be", "possibly", "unclear", "cannot determine"]
-        if any(marker in response.lower() for marker in uncertainty_markers):
+        # CE2: Active prompting — use regex-based uncertainty detection patterns
+        if any(pat.search(response) for pat in self.UNCERTAINTY_PATTERNS):
             response += (
                 "\n\n---\n"
                 "**Confidence Note:** My answer contains some uncertainty. "
@@ -1320,3 +1500,290 @@ class ChatEngine:
         )
         cleaned = " ".join(cleaned.split()).strip()
         return cleaned if cleaned else message.lower()
+
+    # ─────────────────────────────────────────────────
+    # CE-specific helper methods
+    # ─────────────────────────────────────────────────
+
+    # ── CE1: CoVE wrapper ────────────────────────────────────────────
+    async def _maybe_apply_cove(
+        self,
+        response: str,
+        intent: str,
+        session: ConversationContext,
+    ) -> str:
+        """
+        CE1: Apply CoVE (Chain-of-Verification) for configured intents.
+        Skips GENERAL_QA and QUERY_DATA which don't benefit from CoVE.
+        """
+        if intent not in self.cove_enabled_intents:
+            return response
+        # Only apply CoVE if the prompt_engine supports it
+        if not hasattr(self.prompt_engine, "invoke_with_cove"):
+            return response
+        try:
+            verified = await self.prompt_engine.invoke_with_cove(
+                response=response,
+                context=session,
+            )
+            return verified if verified else response
+        except Exception as e:
+            logger.warning("cove_failed", intent=intent, error=str(e))
+            return response
+
+    # ── CE6: Multi-intent detection ────────────────────────────────────
+    def _detect_multi_intent(self, query: str) -> list[str]:
+        """Detect if query contains multiple intents."""
+        SPLIT_PATTERNS = [
+            r'\band\s+also\b',
+            r'\band\s+then\b',
+            r'\bas\s+well\s+as\b',
+            r'\badditionally\b',
+            r'\bplus\b',
+            r'\balso\s+show\b',
+        ]
+        for pat in SPLIT_PATTERNS:
+            if re.search(pat, query, re.IGNORECASE):
+                parts = re.split(pat, query, flags=re.IGNORECASE)
+                return [p.strip() for p in parts if p.strip()]
+        return [query]
+
+    # ── CE7: Session cleanup ───────────────────────────────────────────
+    def _cleanup_stale_sessions(self) -> int:
+        """Remove sessions older than TTL. Returns count removed."""
+        now = time.time()
+        stale = [
+            sid for sid, ctx in self._sessions.items()
+            if (now - getattr(ctx, "_last_active", 0)) > self.SESSION_TTL_SECONDS
+        ]
+        for sid in stale:
+            del self._sessions[sid]
+        # Also enforce max sessions
+        while len(self._sessions) > self.MAX_SESSIONS:
+            oldest = min(
+                self._sessions,
+                key=lambda s: getattr(self._sessions[s], "_last_active", 0),
+            )
+            del self._sessions[oldest]
+        if stale:
+            logger.info("sessions_cleaned", removed=len(stale), remaining=len(self._sessions))
+        return len(stale)
+
+    # ── CE13: User-facing error classification ────────────────────────────
+    def _classify_error(self, error: Exception) -> str:
+        """Return user-friendly error message."""
+        error_str = str(error).lower()
+        if "timeout" in error_str or "timed out" in error_str:
+            return "The request timed out. The data source may be under heavy load. Please try again in a moment."
+        if "connection" in error_str or "unreachable" in error_str:
+            return "Unable to connect to the data source. Please check connector status in Settings."
+        if "rate limit" in error_str or "429" in error_str:
+            return "Rate limit reached. Please wait a moment before retrying."
+        if "auth" in error_str or "401" in error_str or "403" in error_str:
+            return "Authentication error. Please verify credentials in Settings."
+        return f"An unexpected error occurred: {type(error).__name__}. Please try rephrasing your question."
+
+    # ── CE15: Self-RAG pass on similar incidents ──────────────────────────
+    def _verify_similar_incidents(self, incidents: list, query: str) -> list:
+        """Re-score incidents for relevance using Self-RAG keyword overlap."""
+        if not incidents:
+            return incidents
+        verified = []
+        query_terms = set(query.lower().split())
+        for inc in incidents:
+            title = getattr(inc, "title", "")
+            description = getattr(inc, "description", "")
+            error_class = getattr(inc, "error_class", "")
+            inc_terms = set(f"{title} {description} {error_class}".lower().split())
+            overlap = len(query_terms & inc_terms) / max(len(query_terms), 1)
+            if overlap >= 0.15:
+                verified.append(inc)
+        return verified or incidents[:3]  # Fallback to top 3 if none pass
+
+    # ── CE16: Stale runbook detection ───────────────────────────────────
+    def _check_runbook_staleness(self, runbook_metadata: dict) -> Optional[str]:
+        """Return warning if runbook is stale."""
+        last_modified = runbook_metadata.get("last_modified")
+        if last_modified:
+            from datetime import datetime, timezone
+            if isinstance(last_modified, str):
+                last_modified = datetime.fromisoformat(last_modified.replace("Z", "+00:00"))
+            try:
+                age_days = (datetime.now(timezone.utc) - last_modified).days
+            except TypeError:
+                # last_modified may be naive; make it aware
+                if last_modified.tzinfo is None:
+                    from datetime import timezone as _tz
+                    last_modified = last_modified.replace(tzinfo=_tz.utc)
+                age_days = (datetime.now(timezone.utc) - last_modified).days
+            if age_days > self.RUNBOOK_STALENESS_DAYS:
+                return (
+                    f"⚠️ **Note:** This runbook was last updated {age_days} days ago "
+                    f"and may contain outdated information. Please verify steps before executing."
+                )
+        return None
+
+    # ── CE17: Command handling ─────────────────────────────────────────
+    def _handle_commands(self, query: str, session_id: str) -> Optional[str]:
+        """Handle special commands. Returns response if command handled, None otherwise."""
+        cmd = query.strip().lower()
+        if cmd in self.COMMANDS:
+            if session_id in self._sessions:
+                del self._sessions[session_id]
+            return "Session reset. How can I help you?"
+        if cmd == "/export":
+            return self._export_session(session_id)
+        if cmd == "/help":
+            return (
+                "Available commands:\n"
+                "- `/new` or `/reset` — Start a new session\n"
+                "- `/export` — Export conversation\n"
+                "- `/help` — Show this help message"
+            )
+        return None
+
+    def _export_session(self, session_id: str) -> str:
+        """Export session conversation history."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return "No active session to export."
+        lines = [f"# Conversation Export — Session {session_id}\n"]
+        for msg in session.messages:
+            role = getattr(msg, "role", "") if hasattr(msg, "role") else ""
+            content = getattr(msg, "content", str(msg))
+            role_label = role.value if hasattr(role, "value") else str(role)
+            lines.append(f"**{role_label.upper()}:** {content}\n")
+        return "\n".join(lines)
+
+    # ── CE19: Rerun confirmation formatting ──────────────────────────────
+    def _format_rerun_action(self, rerun_url: str, pipeline_name: str) -> str:
+        """Format rerun action with confirmation warning."""
+        return (
+            f"\n\n---\n"
+            f"🔄 **Rerun Available:** [{pipeline_name}]({rerun_url})\n"
+            f"⚠️ **Confirm before rerunning** — This will trigger a new pipeline execution. "
+            f"Ensure the root cause has been addressed first.\n"
+            f"---"
+        )
+
+    # ── CE21: FLARE dedup + summarization ───────────────────────────────
+    def _deduplicate_flare_context(self, existing_context: str, new_chunks: list) -> str:
+        """Deduplicate and summarize FLARE-retrieved content."""
+        existing_sentences = set(existing_context.split('. '))
+        new_content = []
+        for chunk in new_chunks:
+            content = getattr(chunk, "content", "") or ""
+            sentences = content.split('. ')
+            for s in sentences:
+                if s.strip() and s not in existing_sentences:
+                    new_content.append(s)
+                    existing_sentences.add(s)
+        if new_content:
+            return existing_context + "\n\n**Additional Context:**\n" + '. '.join(new_content[:10])
+        return existing_context
+
+    # ── CE22: Proactive follow-up suggestions ────────────────────────────
+    def _generate_follow_ups(self, intent: str) -> str:
+        """Generate follow-up suggestions based on intent."""
+        suggestions = self.FOLLOW_UP_MAP.get(intent, [])
+        if not suggestions:
+            return ""
+        lines = ["\n\n---", "**💡 You might also ask:**"]
+        for s in suggestions[:3]:
+            lines.append(f"- {s}")
+        return "\n".join(lines)
+
+    # ── CE23: Real token-level streaming ───────────────────────────────
+    async def stream_response_tokens(
+        self,
+        query: str,
+        session_id: str,
+        **kwargs: Any,
+    ) -> AsyncGenerator[str, None]:
+        """Real token-level streaming using LLM streaming API."""
+        # CE17: Handle commands
+        command_response = self._handle_commands(query, session_id)
+        if command_response is not None:
+            yield command_response
+            return
+
+        # CE24: Use shared routing
+        session = self._sessions.get(session_id)
+        intent, _confidence = self._route_intent(query, session)
+        prompt = self._build_prompt_for_intent(query, intent, session, **kwargs)
+
+        try:
+            async for token in self._llm_stream(prompt):
+                yield token
+        except Exception as e:
+            yield self._classify_error(e)
+
+    async def _llm_stream(self, prompt: Any) -> AsyncGenerator[str, None]:
+        """Async generator that streams tokens from the LLM."""
+        if hasattr(self.prompt_engine, "invoke_llm_stream"):
+            async for token in self.prompt_engine.invoke_llm_stream(prompt):
+                yield token
+        else:
+            # Fallback: yield full response as a single chunk
+            response = await self.prompt_engine.invoke_llm(prompt)
+            yield response
+
+    def _build_prompt_for_intent(
+        self,
+        query: str,
+        intent: str,
+        session: Optional[ConversationContext],
+        **kwargs: Any,
+    ) -> Any:
+        """Build the prompt messages for a given intent."""
+        if session is None:
+            return self.prompt_engine.build_conversational_prompt(
+                user_question=query,
+                context=None,  # type: ignore[arg-type]
+                rag_context="",
+            )
+        return self.prompt_engine.build_conversational_prompt(
+            user_question=query,
+            context=session,
+            rag_context="",
+        )
+
+    # ── CE24: Unified intent routing ────────────────────────────────────
+    def _route_intent(
+        self,
+        query: str,
+        context: Optional[ConversationContext] = None,
+    ) -> tuple[str, float]:
+        """
+        CE24: Unified intent routing — single source of truth.
+        Returns (intent, confidence).
+        Applies CE8 minimum confidence threshold.
+        """
+        if self.intent_classifier and hasattr(self.intent_classifier, "classify_with_confidence"):
+            intent, confidence = self.intent_classifier.classify_with_confidence(query)
+        elif self.intent_classifier:
+            intent = self.intent_classifier.classify(query)
+            # Estimate confidence from embedding score if available
+            confidence = 0.8  # Default when using embedding classifier
+        else:
+            intent = classify_intent(query)
+            # Estimate confidence from pattern score
+            message_lower = query.lower()
+            scores = {
+                i: sum(1 for p in pats if re.search(p, message_lower))
+                for i, pats in INTENT_PATTERNS.items()
+            }
+            max_score = max(scores.values(), default=0)
+            confidence = min(max_score / 3.0, 1.0) if max_score > 0 else 0.0
+
+        # CE8: Apply minimum confidence threshold
+        if confidence < self.MIN_ROUTING_CONFIDENCE and intent != UserIntent.GENERAL_QA:
+            logger.warning(
+                "low_confidence_routing",
+                original_intent=intent,
+                confidence=round(confidence, 3),
+                fallback="GENERAL_QA",
+            )
+            intent = UserIntent.GENERAL_QA
+
+        return intent, confidence

@@ -260,6 +260,49 @@ class RAGSettings(BaseSettings):
         default=100,
         description="Token overlap between parent chunks to avoid losing context at boundaries.",
     )
+    # Round 2.2: Resilience settings
+    embedding_retry_max_attempts: int = Field(
+        default=3,
+        description="Maximum retry attempts for embedding API calls.",
+    )
+    embedding_retry_base_delay: float = Field(
+        default=1.0,
+        description="Base delay (seconds) for exponential backoff on embedding retries.",
+    )
+    search_retry_max_attempts: int = Field(
+        default=3,
+        description="Maximum retry attempts for Azure AI Search calls.",
+    )
+    search_retry_base_delay: float = Field(
+        default=0.5,
+        description="Base delay (seconds) for exponential backoff on search retries.",
+    )
+    search_circuit_breaker_threshold: int = Field(
+        default=5,
+        description="Consecutive search failures before circuit breaker opens.",
+    )
+    search_circuit_breaker_cooldown: float = Field(
+        default=60.0,
+        description="Seconds before circuit breaker transitions from OPEN to HALF_OPEN.",
+    )
+    end_to_end_latency_budget_ms: int = Field(
+        default=5000,
+        description="End-to-end latency budget (ms) for a complete RAG pipeline request. "
+                    "Tracked across embedding, search, reranking, and LLM generation phases.",
+    )
+    # Round 2.2: Guardrail settings
+    max_response_chars: int = Field(
+        default=15000,
+        description="Maximum characters in a single LLM response before truncation.",
+    )
+    enable_pii_filter: bool = Field(
+        default=True,
+        description="Enable PII detection and redaction in LLM outputs.",
+    )
+    llm_json_max_retries: int = Field(
+        default=2,
+        description="Additional retries when LLM returns malformed JSON (on top of base retries).",
+    )
 
 
 class RoutingSettings(BaseSettings):

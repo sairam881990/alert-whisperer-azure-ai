@@ -41,6 +41,12 @@ from src.rag.advanced_techniques import (
     RAGFusion,
     SelfRAG,
 )
+from src.utils.resilience import (
+    CRAGJudgeResult,
+    LatencyBudget,
+    extract_json_robust,
+    parse_json_with_validation,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -682,16 +688,18 @@ class LLMJudgeCRAG:
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                     max_tokens=200,
+                    response_format={"type": "json_object"},
                 )
                 result_text = response.choices[0].message.content or ""
 
-                # Parse JSON response
-                import json as _json
-                judge_result = _json.loads(
-                    re.search(r'\{.*\}', result_text, re.DOTALL).group()
+                # Parse JSON response with Pydantic validation
+                judge_result = parse_json_with_validation(
+                    result_text,
+                    CRAGJudgeResult,
+                    fallback=CRAGJudgeResult(score=5.0, reasoning="parse_fallback"),
                 )
-                score_val = float(judge_result.get("score", 5)) / 10.0
-                reasoning = judge_result.get("reasoning", "")
+                score_val = judge_result.score / 10.0
+                reasoning = judge_result.reasoning
 
                 if score_val >= 0.7:
                     relevance = CRAGEvaluator.RELEVANCE_CORRECT
@@ -2276,12 +2284,14 @@ class RAGRetriever:
         use_dedicated_reranker: bool = False,
         dedicated_reranker_model: Optional[str] = None,
         llm_client: Any = None,
+        latency_budget_ms: int = 5000,
     ):
         self.vector_store = vector_store
         self.topic_tree = TopicTreeRetriever()
         self.top_k = top_k
         self.similarity_threshold = similarity_threshold
         self.max_context_tokens = max_context_tokens
+        self._latency_budget_ms = latency_budget_ms
 
         # Pre-retrieval components
         self.query_rewriter = QueryRewriter(llm_client=llm_client) if enable_query_rewriting else None
@@ -2472,59 +2482,78 @@ class RAGRetriever:
         1. Query Rewriting (pre-retrieval)
         2. RAG Fusion or Agentic RAG (retrieval)
         3. CRAG + Cross-Encoder Reranking (post-retrieval)
+
+        Wrapped in a LatencyBudget tracker to monitor end-to-end
+        latency across embedding, search, reranking, and LLM phases.
         """
+        budget = LatencyBudget(
+            total_ms=getattr(self, '_latency_budget_ms', 5000),
+            label=f"retrieve_for_query:{query[:60]}",
+        )
+
         # ── PRE-RETRIEVAL: Query Rewriting ───────────
         search_query = query
         if self.query_rewriter and active_alert:
-            rewritten = await self.query_rewriter.rewrite(
-                query=query,
-                pipeline_name=active_alert.pipeline_name if active_alert else "",
-                error_class=active_alert.error_class if active_alert else "",
-            )
+            with budget.phase("query_rewriting"):
+                rewritten = await self.query_rewriter.rewrite(
+                    query=query,
+                    pipeline_name=active_alert.pipeline_name if active_alert else "",
+                    error_class=active_alert.error_class if active_alert else "",
+                )
             # Use the enriched version if available
             if len(rewritten) > 1:
                 search_query = rewritten[1]  # First rewritten variant
 
         # ── RETRIEVAL ────────────────────────────────
         if self.rag_fusion and not source_filter:
-            # RAG Fusion: multi-query decomposition + RRF
-            result = await self.rag_fusion.retrieve_and_fuse(
-                query=search_query,
-                top_k=self.top_k,
-                use_hybrid=True,
-            )
+            with budget.phase("rag_fusion_retrieval"):
+                # RAG Fusion: multi-query decomposition + RRF
+                result = await self.rag_fusion.retrieve_and_fuse(
+                    query=search_query,
+                    top_k=self.top_k,
+                    use_hybrid=True,
+                )
         elif self.agentic_rag and not source_filter:
-            # Agentic RAG: plan and execute multi-source retrieval
-            plan = self.agentic_rag.plan_retrieval(
-                query=search_query,
-                active_alert=active_alert,
-            )
-            result = await self.agentic_rag.execute_plan(plan)
+            with budget.phase("agentic_rag_retrieval"):
+                # Agentic RAG: plan and execute multi-source retrieval
+                plan = self.agentic_rag.plan_retrieval(
+                    query=search_query,
+                    active_alert=active_alert,
+                )
+                result = await self.agentic_rag.execute_plan(plan)
         else:
-            # Fallback: simple vector search
-            result = await self.vector_store.search(
-                query=search_query,
-                top_k=self.top_k,
-                similarity_threshold=self.similarity_threshold,
-                source_type=source_filter,
-                use_hybrid=True,
-            )
+            with budget.phase("vector_search"):
+                # Fallback: simple vector search
+                result = await self.vector_store.search(
+                    query=search_query,
+                    top_k=self.top_k,
+                    similarity_threshold=self.similarity_threshold,
+                    source_type=source_filter,
+                    use_hybrid=True,
+                )
 
         # ── POST-RETRIEVAL ───────────────────────────
         # CRAG filtering
         if self.crag and result.chunks:
-            scores = self.crag.grade_retrieval(query, result.chunks)
-            result.chunks, _ = self.crag.apply_correction(result.chunks, scores)
-            result.total_found = len(result.chunks)
+            with budget.phase("crag_filtering"):
+                scores = self.crag.grade_retrieval(query, result.chunks)
+                result.chunks, _ = self.crag.apply_correction(result.chunks, scores)
+                result.total_found = len(result.chunks)
 
         # Cross-Encoder Reranking
         if self.cross_encoder and result.chunks:
-            result.chunks = await self.cross_encoder.rerank(
-                query=query,
-                chunks=result.chunks,
-            )
-            result.total_found = len(result.chunks)
-            result.reranked = True
+            with budget.phase("cross_encoder_reranking"):
+                result.chunks = await self.cross_encoder.rerank(
+                    query=query,
+                    chunks=result.chunks,
+                )
+                result.total_found = len(result.chunks)
+                result.reranked = True
+
+        # ── LATENCY BUDGET CHECK ─────────────────────
+        budget.log_if_exceeded()
+        result.metadata = result.metadata or {}
+        result.metadata["latency_budget"] = budget.breakdown
 
         return result
 

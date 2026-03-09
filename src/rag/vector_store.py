@@ -27,6 +27,7 @@ from typing import Any, Optional
 import structlog
 
 from src.models import DocumentChunk, ParentChildChunk, RetrievalResult
+from src.utils.resilience import CircuitBreaker, retry_with_backoff
 
 logger = structlog.get_logger(__name__)
 
@@ -444,9 +445,13 @@ class EmbeddingClient:
         api_base: str = "",
         api_version: str = "2024-02-01",
         provider: str = "azure_openai",
+        retry_max_attempts: int = 3,
+        retry_base_delay: float = 1.0,
     ):
         self.provider = provider
         self._client: Optional[AsyncOpenAI] = None
+        self._embed_retry_max = retry_max_attempts
+        self._embed_retry_delay = retry_base_delay
 
         if not _OPENAI_AVAILABLE:
             logger.warning("openai_sdk_missing", msg="EmbeddingClient will return zero vectors")
@@ -468,6 +473,10 @@ class EmbeddingClient:
         """
         Generate embeddings for a list of texts.
 
+        Uses retry_with_backoff for transient failures (rate limits,
+        network errors). Falls back to zero vectors only after all
+        retry attempts are exhausted.
+
         Returns:
             List of 3072-dimensional float vectors (one per input text).
             Falls back to zero vectors if the API is unavailable.
@@ -476,10 +485,15 @@ class EmbeddingClient:
             return [[0.0] * self.DIMENSIONS for _ in texts]
 
         try:
-            response = await self._client.embeddings.create(
-                model=self.MODEL,
-                input=texts,
-                dimensions=self.DIMENSIONS,
+            response = await retry_with_backoff(
+                coro_factory=lambda: self._client.embeddings.create(
+                    model=self.MODEL,
+                    input=texts,
+                    dimensions=self.DIMENSIONS,
+                ),
+                max_retries=self._embed_retry_max,
+                base_delay=self._embed_retry_delay,
+                operation_name="embedding_api",
             )
             return [item.embedding for item in response.data]
         except Exception as e:
@@ -1018,10 +1032,26 @@ class VectorStore:
         embedding_api_base: str = "",
         embedding_api_version: str = "2024-02-01",
         embedding_provider: str = "azure_openai",
+        # Resilience config (Round 2.2)
+        embedding_retry_max: int = 3,
+        embedding_retry_delay: float = 1.0,
+        search_retry_max: int = 3,
+        search_retry_delay: float = 0.5,
+        search_cb_threshold: int = 5,
+        search_cb_cooldown: float = 60.0,
     ):
         self.persist_directory = persist_directory
         self.collection_name = collection_name
         self.hybrid_alpha = hybrid_alpha
+
+        # ── Resilience: search retry + circuit breaker ──
+        self._search_retry_max = search_retry_max
+        self._search_retry_delay = search_retry_delay
+        self._search_circuit_breaker = CircuitBreaker(
+            name="azure_ai_search",
+            threshold=search_cb_threshold,
+            cooldown_seconds=search_cb_cooldown,
+        )
 
         # ── Embedding client ────────────────────────
         self._embedding_client = EmbeddingClient(
@@ -1029,6 +1059,8 @@ class VectorStore:
             api_base=embedding_api_base,
             api_version=embedding_api_version,
             provider=embedding_provider,
+            retry_max_attempts=embedding_retry_max,
+            retry_base_delay=embedding_retry_delay,
         )
 
         # ── Azure AI Search client ──────────────────
@@ -1507,8 +1539,24 @@ class VectorStore:
             search_kwargs["query_type"] = "semantic"
             search_kwargs["semantic_configuration_name"] = "semantic-config"
 
+        # ── Circuit Breaker gate ──────────────────────
+        if not self._search_circuit_breaker.allow_request():
+            logger.warning("azure_search_circuit_open", msg="Falling back to in-memory")
+            return await self._search_inmemory(
+                query=query, top_k=top_k, similarity_threshold=similarity_threshold,
+                source_type=source_type, metadata_filter=metadata_filter, do_hybrid=True,
+            )
+
         try:
-            results = self._search_client.search(**search_kwargs)
+            # Retry with exponential backoff on transient Azure Search failures
+            results = await retry_with_backoff(
+                coro_factory=lambda: self._execute_azure_search(search_kwargs),
+                max_retries=self._search_retry_max,
+                base_delay=self._search_retry_delay,
+                operation_name="azure_ai_search",
+            )
+
+            self._search_circuit_breaker.record_success()
 
             chunks = []
             for result in results:
@@ -1551,12 +1599,23 @@ class VectorStore:
             return chunks
 
         except Exception as e:
+            self._search_circuit_breaker.record_failure()
             logger.error("azure_search_query_error", error=str(e))
             # Fall back to in-memory
             return await self._search_inmemory(
                 query=query, top_k=top_k, similarity_threshold=similarity_threshold,
                 source_type=source_type, metadata_filter=metadata_filter, do_hybrid=True,
             )
+
+    async def _execute_azure_search(self, search_kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+        """Execute raw Azure AI Search query. Wrapped by retry_with_backoff."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        # Azure SDK search client is sync — run in executor to avoid blocking
+        results = await loop.run_in_executor(
+            None, lambda: list(self._search_client.search(**search_kwargs))
+        )
+        return results
 
     async def _search_inmemory(
         self,

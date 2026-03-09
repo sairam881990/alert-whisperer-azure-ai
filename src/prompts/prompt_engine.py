@@ -42,6 +42,12 @@ from src.models import (
     ThoughtBranch,
     VerificationClaim,
 )
+from src.utils.resilience import (
+    OutputGuardrails,
+    extract_json_robust,
+    parse_json_with_validation,
+    retry_with_backoff,
+)
 from src.prompts.templates import (
     COLD_START_PROMPT,
     CURATED_FEW_SHOT_EXAMPLES,
@@ -473,6 +479,9 @@ class PromptEngine:
         tool_registry: Optional["ToolRegistry"] = None,
         conversation_token_budget: int = 8000,
         prompt_cache_ttl_seconds: Optional[int] = None,
+        max_response_chars: int = 15000,
+        enable_pii_filter: bool = True,
+        llm_json_max_retries: int = 2,
     ):
         self.llm_client = llm_client
         self.max_context_tokens = max_context_tokens
@@ -483,6 +492,13 @@ class PromptEngine:
         self.tool_registry = tool_registry or DEFAULT_TOOL_REGISTRY
         # P11: token budget for conversation history (approximate chars; 1 token ≈ 4 chars)
         self.conversation_token_budget = conversation_token_budget
+        # Round 2.2: Output guardrails (PII filter + length limits)
+        self._guardrails = OutputGuardrails(
+            max_chars=max_response_chars,
+            enable_pii_filter=enable_pii_filter,
+        )
+        # Round 2.2: JSON retry budget for malformed LLM responses
+        self._json_max_retries = llm_json_max_retries
         # P8: DSPy optimizer shares the same temperature default as PromptEngine
         self.dspy_optimizer = DSPyPromptOptimizer(default_temperature=default_temperature)
         # PE5: Configurable prompt cache TTL; reads from settings.llm if not provided
@@ -865,6 +881,8 @@ class PromptEngine:
                 result = await asyncio.wait_for(_call(), timeout=effective_timeout)
             else:
                 result = await _call()
+            # Round 2.2: Apply output guardrails (PII filter + length limit)
+            result = self._guardrails.apply(result)
             return result
         except asyncio.TimeoutError:
             logger.error(
@@ -879,6 +897,60 @@ class PromptEngine:
         except Exception as e:
             logger.error("llm_invocation_error", error=str(e))
             raise
+
+    async def invoke_llm_json(
+        self,
+        messages: list[dict[str, str]],
+        model_class: type,
+        temperature: Optional[float] = None,
+        max_tokens: int = 1024,
+        timeout: Optional[float] = None,
+        fallback: Any = None,
+    ) -> Any:
+        """Round 2.2: Invoke LLM with response_format=json_object, parse with Pydantic,
+        and retry on malformed output.
+
+        Args:
+            messages: Prompt messages.
+            model_class: Pydantic model to validate the JSON against.
+            temperature: Override temperature.
+            max_tokens: Max response tokens.
+            timeout: Override timeout.
+            fallback: Fallback value if all retries fail.
+
+        Returns:
+            Validated Pydantic model instance.
+        """
+        last_error: Optional[Exception] = None
+        for attempt in range(1 + self._json_max_retries):
+            try:
+                raw = await self.invoke_llm(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format="json",
+                    timeout=timeout,
+                )
+                return parse_json_with_validation(raw, model_class, fallback=fallback)
+            except (ValueError, Exception) as e:
+                last_error = e
+                if attempt < self._json_max_retries:
+                    logger.warning(
+                        "llm_json_retry",
+                        attempt=attempt + 1,
+                        model=model_class.__name__,
+                        error=str(e),
+                    )
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+        if fallback is not None:
+            logger.warning(
+                "llm_json_fallback",
+                model=model_class.__name__,
+                error=str(last_error),
+            )
+            return fallback
+        raise last_error  # type: ignore[misc]
 
     async def invoke_with_reflexion(
         self,
@@ -950,13 +1022,18 @@ class PromptEngine:
         return verified_output, claims
 
     def parse_routing_response(self, response: str) -> Optional[RoutingOutput]:
-        """Parse LLM routing response into structured RoutingOutput."""
+        """Parse LLM routing response into structured RoutingOutput.
+
+        Round 2.2: Uses robust JSON extraction (handles nested braces, markdown fences)
+        and Pydantic validation instead of fragile regex.
+        """
         try:
-            json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                return RoutingOutput(**data)
-        except (json.JSONDecodeError, Exception) as e:
+            return parse_json_with_validation(
+                response,
+                RoutingOutput,
+                fallback=None,  # type: ignore[arg-type]
+            )
+        except (ValueError, Exception) as e:
             logger.warning("routing_parse_failed", error=str(e))
         return None
 

@@ -210,6 +210,7 @@ class RetrievalResult(BaseModel):
     total_found: int
     retrieval_time_ms: float
     reranked: bool = False
+    metadata: Optional[dict[str, Any]] = Field(default=None, description="Pipeline metadata (e.g. latency budget breakdown)")
 
 
 class TopicNode(BaseModel):

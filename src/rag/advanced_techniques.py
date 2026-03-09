@@ -36,6 +36,12 @@ from typing import Any, Optional
 import structlog
 
 from src.models import DocumentChunk, RetrievalResult
+from src.utils.resilience import (
+    RerankerScore,
+    SelfEvalResult,
+    extract_json_robust,
+    parse_json_with_validation,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -239,16 +245,18 @@ class CrossEncoderReranker:
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                     max_tokens=100,
+                    response_format={"type": "json_object"},
                 )
                 result_text = response.choices[0].message.content or ""
-                match = re.search(r'\{.*\}', result_text, re.DOTALL)
-                if match:
-                    result = json.loads(match.group())
-                    score = float(result.get("score", 0.5))
-                    chunk.metadata["reranker_score"] = round(score, 4)
-                    chunk.metadata["reranker_reason"] = result.get("reason", "")
-                    return (score, chunk)
-                return (0.5, chunk)
+                # Round 2.2: Robust JSON extraction + Pydantic validation
+                parsed = parse_json_with_validation(
+                    result_text,
+                    RerankerScore,
+                    fallback=RerankerScore(),
+                )
+                chunk.metadata["reranker_score"] = round(parsed.score, 4)
+                chunk.metadata["reranker_reason"] = parsed.reason
+                return (parsed.score, chunk)
 
             return await asyncio.wait_for(_call(), timeout=timeout_s)
 
@@ -671,21 +679,39 @@ class RAGFusion:
         )
 
     async def _llm_generate_variants(self, query: str) -> list[str]:
-        """Generate query variants using LLM."""
+        """Generate query variants using LLM.
+
+        Round 2.2: Uses response_format=json_object and robust JSON extraction.
+        """
         try:
-            prompt = self.FUSION_PROMPT.format(query=query)
+            # Wrap prompt to request JSON object (response_format requires object root)
+            prompt = (
+                self.FUSION_PROMPT.format(query=query)
+                + '\n\nReturn your answer as a JSON object: {"queries": ["variant1", "variant2", ...]}'
+            )
             response = await self.llm_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=300,
+                response_format={"type": "json_object"},
             )
             text = response.choices[0].message.content or ""
-            # Parse JSON array
-            match = re.search(r'\[.*\]', text, re.DOTALL)
-            if match:
-                variants = json.loads(match.group())
+            # Round 2.2: Robust extraction with fallback
+            try:
+                data = extract_json_robust(text)
+                if isinstance(data, dict) and "queries" in data:
+                    variants = data["queries"]
+                elif isinstance(data, list):
+                    variants = data
+                else:
+                    variants = []
                 return [v for v in variants if isinstance(v, str) and len(v) > 5]
+            except ValueError:
+                # Try array extraction as fallback
+                data = extract_json_robust(text, expect_array=True)
+                if isinstance(data, list):
+                    return [v for v in data if isinstance(v, str) and len(v) > 5]
         except Exception as e:
             logger.warning("rag_fusion_llm_error", error=str(e))
 
@@ -955,7 +981,11 @@ class SelfRAG:
         context: str,
         segment: str,
     ) -> dict[str, Any]:
-        """Evaluate a single response segment using LLM."""
+        """Evaluate a single response segment using LLM.
+
+        Round 2.2: Uses response_format=json_object and Pydantic validation.
+        """
+        default_result = SelfEvalResult()
         try:
             prompt = self.SELF_EVAL_PROMPT.format(
                 query=query[:300],
@@ -967,15 +997,20 @@ class SelfRAG:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=200,
+                response_format={"type": "json_object"},
             )
             text = response.choices[0].message.content or ""
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                return json.loads(match.group())
+            # Round 2.2: Robust JSON extraction + Pydantic validation
+            parsed = parse_json_with_validation(
+                text,
+                SelfEvalResult,
+                fallback=default_result,
+            )
+            return parsed.model_dump()
         except Exception as e:
             logger.warning("self_rag_eval_error", error=str(e))
 
-        return {"supported": "unknown", "relevant": "unknown", "confidence": 0.5, "needs_retrieval": "no"}
+        return default_result.model_dump()
 
     def _heuristic_evaluate(
         self,

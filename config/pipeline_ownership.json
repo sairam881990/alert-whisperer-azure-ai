@@ -1,0 +1,76 @@
+{
+  "pipelines": {
+    "spark_etl_daily_ingest": {
+      "owner": "data-platform-team",
+      "oncall_channel": "dp-oncall",
+      "escalation_contacts": ["alice@company.com", "bob@company.com"],
+      "severity_default": "high",
+      "tags": ["spark", "etl", "daily"],
+      "runbook_confluence_id": "RUNBOOKS-101"
+    },
+    "synapse_pipeline_customer360": {
+      "owner": "analytics-team",
+      "oncall_channel": "analytics-oncall",
+      "escalation_contacts": ["carol@company.com"],
+      "severity_default": "critical",
+      "tags": ["synapse", "customer", "analytics"],
+      "runbook_confluence_id": "RUNBOOKS-202"
+    },
+    "kusto_ingestion_telemetry": {
+      "owner": "telemetry-team",
+      "oncall_channel": "telemetry-oncall",
+      "escalation_contacts": ["dave@company.com", "eve@company.com"],
+      "severity_default": "medium",
+      "tags": ["kusto", "ingestion", "telemetry"],
+      "runbook_confluence_id": "RUNBOOKS-303"
+    },
+    "spark_streaming_clickstream": {
+      "owner": "data-platform-team",
+      "oncall_channel": "dp-oncall",
+      "escalation_contacts": ["alice@company.com"],
+      "severity_default": "critical",
+      "tags": ["spark", "streaming", "clickstream"],
+      "runbook_confluence_id": "RUNBOOKS-104"
+    },
+    "synapse_dw_refresh": {
+      "owner": "data-warehouse-team",
+      "oncall_channel": "dw-oncall",
+      "escalation_contacts": ["frank@company.com", "grace@company.com"],
+      "severity_default": "high",
+      "tags": ["synapse", "warehouse", "refresh"],
+      "runbook_confluence_id": "RUNBOOKS-205"
+    }
+  },
+  "default_routing": {
+    "owner": "platform-engineering",
+    "oncall_channel": "platform-oncall",
+    "escalation_contacts": ["platform-lead@company.com"],
+    "severity_default": "medium"
+  },
+  "severity_levels": {
+    "critical": {
+      "response_sla_minutes": 5,
+      "auto_escalate": true,
+      "notify_management": true,
+      "color": "#FF0000"
+    },
+    "high": {
+      "response_sla_minutes": 15,
+      "auto_escalate": true,
+      "notify_management": false,
+      "color": "#FF8C00"
+    },
+    "medium": {
+      "response_sla_minutes": 60,
+      "auto_escalate": false,
+      "notify_management": false,
+      "color": "#FFD700"
+    },
+    "low": {
+      "response_sla_minutes": 240,
+      "auto_escalate": false,
+      "notify_management": false,
+      "color": "#32CD32"
+    }
+  }
+}

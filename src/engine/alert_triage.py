@@ -304,6 +304,9 @@ class AlertTriageEngine:
     def get_top_clusters(self, limit: int = 5) -> list[TriagedCluster]:
         """Get top N clusters ranked by severity + business impact."""
         clusters = list(self._triaged_clusters.values())
+        # AT9: Apply severity time-decay before ranking
+        for cluster in clusters:
+            self._decay_cluster_severity(cluster)
         clusters.sort(key=lambda c: c.severity_rank, reverse=True)
         return clusters[:limit]
 

@@ -456,17 +456,23 @@ class ChatEngine:
         re.compile(r'\bapproximately\b', re.IGNORECASE),
     ]
 
-    # ── CE3: Per-intent temperature map ───────────────────────────────────
+    # ── CE3: Per-intent temperature map (keys match UserIntent constants) ──
     INTENT_TEMPERATURE_MAP: dict[str, float] = {
-        "ROOT_CAUSE": 0.05,
-        "TROUBLESHOOT": 0.05,
-        "PIPELINE_DETAIL": 0.1,
-        "ALERT_SEARCH": 0.1,
-        "RUNBOOK": 0.1,
-        "ESCALATION": 0.1,
-        "HEALTH_CHECK": 0.15,
-        "CROSS_ALERT_ANALYTICS": 0.15,
-        "GENERAL": 0.3,
+        UserIntent.ROOT_CAUSE_DETAIL: 0.05,
+        UserIntent.SIMILAR_INCIDENTS: 0.05,
+        UserIntent.VIEW_LOGS: 0.1,
+        UserIntent.ALERT_SEARCH: 0.1,
+        UserIntent.RUNBOOK_LOOKUP: 0.1,
+        UserIntent.ESCALATION: 0.1,
+        UserIntent.PLATFORM_HEALTH: 0.15,
+        UserIntent.CROSS_ALERT_ANALYTICS: 0.15,
+        UserIntent.ALERT_DISCOVERY: 0.15,
+        UserIntent.TREND_ANALYSIS: 0.15,
+        UserIntent.BLAST_RADIUS: 0.1,
+        UserIntent.RERUN_PIPELINE: 0.1,
+        UserIntent.QUERY_DATA: 0.1,
+        UserIntent.STATUS_UPDATE: 0.15,
+        UserIntent.GENERAL_QA: 0.3,
     }
 
     # ── CE7: Session TTL management ────────────────────────────────────────
@@ -578,6 +584,8 @@ class ChatEngine:
         """Bind an alert to an existing session."""
         session = self._sessions.get(session_id)
         if session:
+            # Clear stale runbook context from any previous alert binding
+            session.runbook_context = None
             session.active_alert = alert
             if analysis:
                 session.similar_incidents = analysis.similar_incidents
@@ -626,39 +634,34 @@ class ChatEngine:
         intent, confidence = self._route_intent(user_message, session)
         logger.info("intent_classified", session_id=session_id, intent=intent, confidence=round(confidence, 3))
 
-        # CE6: Detect multi-intent and handle the primary one
+        # CE3: Set per-intent temperature for downstream invoke_llm calls
+        self._current_temperature = self._get_temperature_for_intent(intent)
+
+        # CE4: Check response cache before routing
+        context_hash = hashlib.sha256(
+            f"{session.active_alert.failure_id if session.active_alert else ''}::{session.message_count}".encode()
+        ).hexdigest()[:12]
+        cached = self._response_cache.get(user_message, intent, context_hash)
+        if cached is not None:
+            logger.info("response_cache_hit", session_id=session_id, intent=intent)
+            session.add_message(MessageRole.ASSISTANT, cached)
+            return cached
+
+        # CE6: Detect multi-intent and route each sub-query
         sub_queries = self._detect_multi_intent(user_message)
         if len(sub_queries) > 1:
             logger.info("multi_intent_detected", count=len(sub_queries))
-
-        # Route to handler — alert-free intents first
-        if intent == UserIntent.ALERT_DISCOVERY:
-            response = await self._handle_alert_discovery(session, user_message)
-        elif intent == UserIntent.PLATFORM_HEALTH:
-            response = await self._handle_platform_health(session, user_message)
-        elif intent == UserIntent.ALERT_SEARCH:
-            response = await self._handle_alert_search(session, user_message)
-        elif intent == UserIntent.CROSS_ALERT_ANALYTICS:
-            response = await self._handle_cross_alert_analytics(session, user_message)
-        # Alert-bound intents
-        elif intent == UserIntent.SIMILAR_INCIDENTS:
-            response = await self._handle_similar_incidents(session, user_message)
-        elif intent == UserIntent.RUNBOOK_LOOKUP:
-            response = await self._handle_runbook_lookup(session, user_message)
-        elif intent == UserIntent.ROOT_CAUSE_DETAIL:
-            response = await self._handle_root_cause_detail(session, user_message)
-        elif intent == UserIntent.VIEW_LOGS:
-            response = await self._handle_view_logs(session, user_message)
-        elif intent == UserIntent.RERUN_PIPELINE:
-            response = self._handle_rerun_request(session)
-        elif intent == UserIntent.ESCALATION:
-            response = await self._handle_escalation(session, user_message)
-        elif intent == UserIntent.TREND_ANALYSIS:
-            response = await self._handle_trend_analysis(session, user_message)
-        elif intent == UserIntent.BLAST_RADIUS:
-            response = await self._handle_blast_radius(session, user_message)
+            # Process each sub-query independently and merge responses
+            responses: list[str] = []
+            for sq in sub_queries:
+                sq_intent, _sq_conf = self._route_intent(sq, session)
+                self._current_temperature = self._get_temperature_for_intent(sq_intent)
+                sq_response = await self._route_to_handler(sq_intent, session, sq)
+                responses.append(sq_response)
+            response = "\n\n---\n\n".join(responses)
         else:
-            response = await self._handle_general_qa(session, user_message)
+            # Single intent — standard routing
+            response = await self._route_to_handler(intent, session, user_message)
 
         # FLARE: Check if response needs supplemental retrieval
         # Only triggers when confidence is genuinely low — not on casual hedging
@@ -697,6 +700,9 @@ class ChatEngine:
         # CE22: Append proactive follow-up suggestions
         response += self._generate_follow_ups(intent)
 
+        # CE4: Cache the final response
+        self._response_cache.put(user_message, intent, response, context_hash)
+
         session.add_message(MessageRole.ASSISTANT, response)
         return response
 
@@ -706,16 +712,10 @@ class ChatEngine:
         user_message: str,
     ):
         """
-        Process a user message with streaming support and async FLARE.
+        CE23: Streaming entry point — delegates to stream_response_tokens
+        for real token-level streaming, with FLARE augmentation afterward.
 
-        Yields partial response chunks for real-time UI updates.
-        FLARE retrieval happens asynchronously between generation chunks.
-
-        Why async FLARE streaming for Spark/Synapse/Kusto troubleshooting:
-        - Support engineers need immediate feedback during high-severity incidents
-        - FLARE retrieval can run concurrently with response display
-        - Streaming shows progressive investigation steps, building confidence
-        - Mid-stream retrieval results appear as they become available
+        No longer duplicates process_message routing logic.
         """
         # CE7: Cleanup stale sessions
         self._cleanup_stale_sessions()
@@ -737,48 +737,31 @@ class ChatEngine:
         except AttributeError:
             pass
 
-        # CE24: Use shared routing method
+        # CE24: Use shared routing
         intent, confidence = self._route_intent(user_message, session)
+        self._current_temperature = self._get_temperature_for_intent(intent)
         logger.info("streaming_intent_classified", session_id=session_id, intent=intent, confidence=round(confidence, 3))
 
-        # Generate initial response — alert-free intents first
-        if intent == UserIntent.ALERT_DISCOVERY:
-            response = await self._handle_alert_discovery(session, user_message)
-        elif intent == UserIntent.PLATFORM_HEALTH:
-            response = await self._handle_platform_health(session, user_message)
-        elif intent == UserIntent.ALERT_SEARCH:
-            response = await self._handle_alert_search(session, user_message)
-        elif intent == UserIntent.CROSS_ALERT_ANALYTICS:
-            response = await self._handle_cross_alert_analytics(session, user_message)
-        elif intent == UserIntent.SIMILAR_INCIDENTS:
-            response = await self._handle_similar_incidents(session, user_message)
-        elif intent == UserIntent.RUNBOOK_LOOKUP:
-            response = await self._handle_runbook_lookup(session, user_message)
-        elif intent == UserIntent.ROOT_CAUSE_DETAIL:
-            response = await self._handle_root_cause_detail(session, user_message)
-        elif intent == UserIntent.VIEW_LOGS:
-            response = await self._handle_view_logs(session, user_message)
-        elif intent == UserIntent.RERUN_PIPELINE:
-            response = self._handle_rerun_request(session)
-        elif intent == UserIntent.ESCALATION:
-            response = await self._handle_escalation(session, user_message)
-        elif intent == UserIntent.TREND_ANALYSIS:
-            response = await self._handle_trend_analysis(session, user_message)
-        elif intent == UserIntent.BLAST_RADIUS:
-            response = await self._handle_blast_radius(session, user_message)
-        else:
-            response = await self._handle_general_qa(session, user_message)
+        # CE23: Delegate to stream_response_tokens for real token-level streaming
+        collected_tokens: list[str] = []
+        async for token in self.stream_response_tokens(user_message, session_id):
+            collected_tokens.append(token)
+            yield token
 
-        # CE1: Apply CoVE for configured intents
-        response = await self._maybe_apply_cove(response, intent, session)
+        response = "".join(collected_tokens)
+
+        # CE1: Apply CoVE for configured intents (post-stream enrichment)
+        verified = await self._maybe_apply_cove(response, intent, session)
+        if verified != response:
+            supplement = verified[len(response):] if verified.startswith(response) else f"\n\n{verified}"
+            response = verified
+            yield supplement
 
         # CE22: Append follow-up suggestions
         follow_ups = self._generate_follow_ups(intent)
         if follow_ups:
             response += follow_ups
-
-        # Yield initial response
-        yield response
+            yield follow_ups
 
         # Async FLARE: retrieve supplemental context in background
         if self.rag_retriever.flare:
@@ -792,7 +775,6 @@ class ChatEngine:
                     segments, existing_context=response
                 )
                 if flare_result and flare_result.chunks:
-                    # CE21: Deduplicate FLARE context
                     new_response = self._deduplicate_flare_context(response, flare_result.chunks)
                     flare_supplement = new_response[len(response):]
                     response = new_response
@@ -1153,7 +1135,7 @@ class ChatEngine:
             rag_context=rag_context,
             technique=technique,
         )
-        response = await self.prompt_engine.invoke_llm(messages)
+        response = await self.prompt_engine.invoke_llm(messages, temperature=getattr(self, '_current_temperature', None))
 
         # Apply Reflexion for self-refinement on critical alerts
         if session.active_alert.severity.value in ("critical", "high"):
@@ -1338,7 +1320,7 @@ class ChatEngine:
             context=session,
             rag_context=rag_context,
         )
-        return await self.prompt_engine.invoke_llm(messages)
+        return await self.prompt_engine.invoke_llm(messages, temperature=getattr(self, '_current_temperature', None))
 
     async def _handle_general_qa(
         self,
@@ -1364,7 +1346,7 @@ class ChatEngine:
                 context=session,
             )
             logger.info("cold_start_routing_applied", session_id=session.session_id)
-            return await self.prompt_engine.invoke_llm(messages)
+            return await self.prompt_engine.invoke_llm(messages, temperature=getattr(self, '_current_temperature', None))
 
         # Retrieve context using Agentic RAG (multi-source)
         result = await self.rag_retriever.retrieve_for_query(
@@ -1378,7 +1360,7 @@ class ChatEngine:
             context=session,
             rag_context=rag_context,
         )
-        response = await self.prompt_engine.invoke_llm(messages)
+        response = await self.prompt_engine.invoke_llm(messages, temperature=getattr(self, '_current_temperature', None))
 
         # CE2: Active prompting — use regex-based uncertainty detection patterns
         if any(pat.search(response) for pat in self.UNCERTAINTY_PATTERNS):
@@ -1518,15 +1500,28 @@ class ChatEngine:
         """
         if intent not in self.cove_enabled_intents:
             return response
-        # Only apply CoVE if the prompt_engine supports it
-        if not hasattr(self.prompt_engine, "invoke_with_cove"):
+        # Only apply CoVE if the prompt_engine supports invoke_with_verification
+        if not hasattr(self.prompt_engine, "invoke_with_verification"):
             return response
         try:
-            verified = await self.prompt_engine.invoke_with_cove(
-                response=response,
-                context=session,
+            # Build evidence from recent conversation context
+            evidence = "\n".join(
+                f"{m.role.value}: {m.content[:500]}"
+                for m in session.get_recent_messages(5)
             )
-            return verified if verified else response
+            alert_context = ""
+            if session.active_alert:
+                alert_context = (
+                    f"Pipeline: {session.active_alert.pipeline_name}, "
+                    f"Error: {session.active_alert.error_class}, "
+                    f"Severity: {session.active_alert.severity.value}"
+                )
+            verified_text, _claims = await self.prompt_engine.invoke_with_verification(
+                analysis=response,
+                evidence=evidence,
+                alert_context=alert_context,
+            )
+            return verified_text if verified_text else response
         except Exception as e:
             logger.warning("cove_failed", intent=intent, error=str(e))
             return response
@@ -1548,6 +1543,41 @@ class ChatEngine:
                 return [p.strip() for p in parts if p.strip()]
         return [query]
 
+    # ── CE6: Unified handler dispatch ─────────────────────────────────
+    async def _route_to_handler(
+        self,
+        intent: str,
+        session: ConversationContext,
+        message: str,
+    ) -> str:
+        """Route a single intent to its handler. Used by both single- and multi-intent paths."""
+        if intent == UserIntent.ALERT_DISCOVERY:
+            return await self._handle_alert_discovery(session, message)
+        elif intent == UserIntent.PLATFORM_HEALTH:
+            return await self._handle_platform_health(session, message)
+        elif intent == UserIntent.ALERT_SEARCH:
+            return await self._handle_alert_search(session, message)
+        elif intent == UserIntent.CROSS_ALERT_ANALYTICS:
+            return await self._handle_cross_alert_analytics(session, message)
+        elif intent == UserIntent.SIMILAR_INCIDENTS:
+            return await self._handle_similar_incidents(session, message)
+        elif intent == UserIntent.RUNBOOK_LOOKUP:
+            return await self._handle_runbook_lookup(session, message)
+        elif intent == UserIntent.ROOT_CAUSE_DETAIL:
+            return await self._handle_root_cause_detail(session, message)
+        elif intent == UserIntent.VIEW_LOGS:
+            return await self._handle_view_logs(session, message)
+        elif intent == UserIntent.RERUN_PIPELINE:
+            return self._handle_rerun_request(session)
+        elif intent == UserIntent.ESCALATION:
+            return await self._handle_escalation(session, message)
+        elif intent == UserIntent.TREND_ANALYSIS:
+            return await self._handle_trend_analysis(session, message)
+        elif intent == UserIntent.BLAST_RADIUS:
+            return await self._handle_blast_radius(session, message)
+        else:
+            return await self._handle_general_qa(session, message)
+
     # ── CE7: Session cleanup ───────────────────────────────────────────
     def _cleanup_stale_sessions(self) -> int:
         """Remove sessions older than TTL. Returns count removed."""
@@ -1568,6 +1598,11 @@ class ChatEngine:
         if stale:
             logger.info("sessions_cleaned", removed=len(stale), remaining=len(self._sessions))
         return len(stale)
+
+    # ── CE3: Resolve temperature for current intent ────────────────────────
+    def _get_temperature_for_intent(self, intent: str) -> float:
+        """Return the temperature setting for the given intent."""
+        return self.INTENT_TEMPERATURE_MAP.get(intent, 0.3)
 
     # ── CE13: User-facing error classification ────────────────────────────
     def _classify_error(self, error: Exception) -> str:

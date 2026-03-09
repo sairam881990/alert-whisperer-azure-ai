@@ -105,6 +105,9 @@ class ParsedFailure(BaseModel):
     log_url: Optional[str] = None
     runbook_url: Optional[str] = None
 
+    # M11: Runbook metadata for enrichment by confluence connector
+    runbook_metadata: Optional[dict[str, Any]] = Field(default=None, description="Runbook metadata from Confluence or other sources")
+
     @field_validator("log_snippet")
     @classmethod
     def truncate_log(cls, v: str) -> str:
@@ -442,6 +445,102 @@ class MCPToolDefinition(BaseModel):
     name: str
     description: str
     input_schema: dict[str, Any]
+
+
+# ─────────────────────────────────────────────────
+# Alert Triage / Cluster Models
+# ─────────────────────────────────────────────────
+
+class CascadeStep(BaseModel):
+    """A single step in a cascading failure chain."""
+    pipeline_name: str
+    error_class: str
+    alert: Optional[ParsedFailure] = None
+    relationship: str = Field(default="downstream_effect", description="e.g. downstream_effect, root_cause")
+
+
+class CascadeCluster(BaseModel):
+    """A cluster of alerts linked by a cascading failure chain."""
+    root_cause_alert: ParsedFailure
+    steps: list[CascadeStep] = Field(default_factory=list)
+
+    def add_step(self, step: CascadeStep) -> None:
+        self.steps.append(step)
+
+    @property
+    def depth(self) -> int:
+        return 1 + len(self.steps)
+
+    @property
+    def affected_pipelines(self) -> set[str]:
+        pipelines = {self.root_cause_alert.pipeline_name}
+        for s in self.steps:
+            pipelines.add(s.pipeline_name)
+        return pipelines
+
+
+class TriagedCluster(BaseModel):
+    """
+    A triaged cluster of related alerts with composite scoring.
+
+    Central model used by AlertTriageEngine and ChatEngine for:
+    - Alert grouping and deduplication
+    - Composite severity ranking
+    - Blast radius tracking
+    - Acknowledgment state
+    """
+    model_config = {"arbitrary_types_allowed": True}
+
+    cluster_id: str
+    primary_alert: ParsedFailure
+    all_alerts: list[ParsedFailure] = Field(default_factory=list)
+    cascade: Optional[CascadeCluster] = None
+
+    # Scoring
+    composite_severity: Severity = Severity.MEDIUM
+    business_impact_score: float = 0.0
+    blast_radius_pipelines: list[str] = Field(default_factory=list)
+    blast_radius_components: list[str] = Field(default_factory=list)
+
+    # Assignment
+    assigned_to: Optional[str] = None
+    assigned_channel: Optional[str] = None
+
+    # Timestamps
+    first_seen: Optional[datetime] = None
+    last_updated: Optional[datetime] = None
+
+    # AT10: Acknowledgment tracking
+    acknowledged: bool = False
+    acknowledged_by: Optional[str] = None
+    acknowledged_at: Optional[datetime] = None
+
+    @property
+    def alert_count(self) -> int:
+        return len(self.all_alerts)
+
+    @property
+    def is_cascade(self) -> bool:
+        return self.cascade is not None and self.cascade.depth > 1
+
+    @property
+    def severity_rank(self) -> float:
+        """Numeric rank for sorting: severity weight + impact + cascade bonus."""
+        sev_weight = {Severity.CRITICAL: 100, Severity.HIGH: 60, Severity.MEDIUM: 30, Severity.LOW: 10}
+        rank = sev_weight.get(self.composite_severity, 0)
+        rank += self.business_impact_score
+        rank += self.alert_count * 2
+        if self.is_cascade:
+            rank += 50
+        return rank
+
+    def add_alert(self, alert: ParsedFailure) -> None:
+        self.all_alerts.append(alert)
+        self.last_updated = alert.timestamp
+        # Upgrade severity if new alert is more severe
+        sev_order = {Severity.LOW: 0, Severity.MEDIUM: 1, Severity.HIGH: 2, Severity.CRITICAL: 3}
+        if sev_order.get(alert.severity, 0) > sev_order.get(self.composite_severity, 0):
+            self.composite_severity = alert.severity
 
 
 # ─────────────────────────────────────────────────

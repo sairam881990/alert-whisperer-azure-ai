@@ -8,6 +8,7 @@ access to log data for failure detection and root cause analysis.
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -32,7 +33,7 @@ LA_QUERIES = {
         | where Level_s in ("ERROR", "FATAL")
         | project TimeGenerated, Level_s, Message_s, LoggerName_s,
                   ClusterId_s, SparkJobId_s, ExceptionClass_s,
-                  StackTrace_s
+                  StackTrace_s = substring(StackTrace_s, 0, 2000)
         | order by TimeGenerated desc
         | take {limit}
     """,
@@ -79,7 +80,7 @@ LA_QUERIES = {
         | where Message_s has "OutOfMemoryError" or Message_s has "OOM"
                 or ExceptionClass_s has "OutOfMemoryError"
         | project TimeGenerated, Message_s, ClusterId_s, SparkJobId_s,
-                  StackTrace_s
+                  StackTrace_s = substring(StackTrace_s, 0, 2000)
         | order by TimeGenerated desc
         | take {limit}
     """,
@@ -177,7 +178,7 @@ LA_QUERIES = {
             FirstSeen    = min(TimeGenerated),
             LastSeen     = max(TimeGenerated),
             SampleError  = anyif(Message_s, Level_s in ("ERROR", "FATAL")),
-            SampleStack  = anyif(StackTrace_s, Level_s in ("ERROR", "FATAL")),
+            SampleStack  = substring(anyif(StackTrace_s, Level_s in ("ERROR", "FATAL")), 0, 2000),
             ExceptionClasses = make_set(ExceptionClass_s, 20)
           by SparkJobId_s, ClusterId_s
         | order by LastSeen desc
@@ -1265,6 +1266,9 @@ class LogAnalyticsMCPClient(BaseMCPClient):
                             "exception_class": row.get("ExceptionClass_s", ""),
                             "logger": row.get("LoggerName_s", ""),
                             "stack_trace": str(row.get("StackTrace_s", ""))[:2000],
+                            "caused_by_chain": self._extract_caused_by_chain(
+                                str(row.get("StackTrace_s", ""))
+                            ),
                         },
                         pipeline_name=f"spark_{row.get('ClusterId_s', 'unknown')}",
                         job_id=row.get("SparkJobId_s"),
@@ -1303,6 +1307,32 @@ class LogAnalyticsMCPClient(BaseMCPClient):
                 logger.warning("executor_event_parse_error", error=str(e))
 
         return entries
+
+    # ─── Caused-By Chain Extraction ─────────────────
+
+    _CAUSED_BY_RE = re.compile(
+        r"Caused by:\s*([\w.$]+(?:Exception|Error|Failure|Fault))(?::\s*(.+?))?(?=\n|$)",
+        re.MULTILINE,
+    )
+
+    def _extract_caused_by_chain(self, stack_trace: str) -> list[dict[str, str]]:
+        """
+        Extract the full Caused-by chain from a JVM stack trace.
+
+        Returns a list of dicts like:
+        [{"exception": "java.lang.OutOfMemoryError", "message": "Java heap space"}, ...]
+
+        The last entry in the chain is typically the true root cause.
+        """
+        if not stack_trace:
+            return []
+        chain: list[dict[str, str]] = []
+        for match in self._CAUSED_BY_RE.finditer(stack_trace):
+            chain.append({
+                "exception": match.group(1),
+                "message": (match.group(2) or "").strip(),
+            })
+        return chain
 
     def _parse_synapse_failures(self, raw: Any) -> list[RawLogEntry]:
         """Parse Synapse pipeline failure entries."""
